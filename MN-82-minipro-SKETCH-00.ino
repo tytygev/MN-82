@@ -224,7 +224,7 @@ class MainController {
                       THRESHOLD, HYSTERESIS_ENABLED,
                       LOWER_THRESHOLD, UPPER_THRESHOLD),
         _rcChannels{
-          RCChannel(PIN_RC_CH1),
+          RCChannel(PIN_RC_CH1), // usePWM по умолчанию false, ШИМ не используется
           RCChannel(PIN_RC_CH2),
           RCChannel(PIN_RC_CH3),
           RCChannel(PIN_RC_CH4),
