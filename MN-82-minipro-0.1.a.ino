@@ -200,7 +200,7 @@ class PulseGenerator {
     // конструктор
     PulseGenerator(OutputController* output, unsigned long onMs, unsigned long offMs)
       : _output(output), _onTime(onMs), _offTime(offMs),
-        _lastToggle(0), _currentState(false), _enabled(true) {}
+        _lastToggle(0), _currentState(false), _enabled(false) {}
 
     void begin() {
       _lastToggle = millis();
@@ -337,29 +337,25 @@ class MainController {
             break;
 
         case 2: // D1 – левый поворотник (положение рычага)
-            if (_tlrFlag) break; // при включённой аварийке игнорируем рычаг
-
             // Переключаем левый, при этом правый выключаем всегда
             _tlFlag = !_tlFlag;
             if (_tlFlag) {
                 _trFlag = false;          // правый не может быть активен одновременно
-                _blinkerR.disable();
-                _blinkerL.enable();
+                if (!_tlrFlag) _blinkerR.disable();// при включённой аварийке игнорируем рычаг
+                if (!_tlrFlag) _blinkerL.enable();// при включённой аварийке игнорируем рычаг
             } else {
-                _blinkerL.disable();
+                if (!_tlrFlag) _blinkerL.disable();// при включённой аварийке игнорируем рычаг
             }
             break;
 
         case 3: // D2 – правый поворотник
-            if (_tlrFlag) break;
-
             _trFlag = !_trFlag;
             if (_trFlag) {
                 _tlFlag = false;
-                _blinkerL.disable();
-                _blinkerR.enable();
+                if (!_tlrFlag) _blinkerL.disable();// при включённой аварийке игнорируем рычаг
+                if (!_tlrFlag) _blinkerR.enable();// при включённой аварийке игнорируем рычаг
             } else {
-                _blinkerR.disable();
+                if (!_tlrFlag) _blinkerR.disable();// при включённой аварийке игнорируем рычаг
             }
             break;
 
@@ -384,52 +380,7 @@ class MainController {
                 }
             }
             break;
-        // if (_rcChannels[i].read()) {
-
-        //     switch (i){
-        //         case 1:
-        //             if (_tfFlag) {
-        //                 _outputs[2].off();
-        //                 _tfFlag=false;
-        //             }else{
-        //                 _outputs[2].on();
-        //                 _tfFlag=true;
-        //             }
-        //             break;
-        //         case 2: 
-        //             if (_tlFlag) {
-        //                 if (!_tlrFlag) {_blinkerL.disable();}
-        //                 _tlFlag=false;
-        //             }else{
-        //                 if (!_tlrFlag) {_blinkerR.disable();}
-        //                  _trFlag=false;
-        //                 _blinkerL.enable();
-        //                 _tlFlag=true;
-        //             }
-        //             break;
-        //         case 3:
-        //             if (_trFlag) {
-        //                 if (!_tlrFlag) {_blinkerR.disable();}
-        //                 _trFlag=false;
-        //             }else{
-        //                 if (!_tlrFlag) {_blinkerL.disable();}
-        //                 _tlFlag=false;
-        //                 _blinkerR.enable();
-        //                 _trFlag=true;
-        //             }
-        //             break;
-        //         case 4:
-        //             if (_tlrFlag) {
-        //                 if (!_tlFlag) {_blinkerL.disable();}
-        //                 if (!_trFlag) {_blinkerR.disable();}
-        //                 _tlrFlag=false;
-        //             }else{
-        //                 _blinkerL.enable();
-        //                 _blinkerR.enable();
-        //                 _tlrFlag=true;
-        //             }
-        //             break;                
-        //     }
+       
 
 
         
