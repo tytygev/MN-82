@@ -7,20 +7,20 @@
 
 // ==================== НАСТРОЙКИ ====================
 // --- Пины ---
-const uint8_t PIN_ANALOG_POLE_A = A0;   // полюс A мотора
-const uint8_t PIN_ANALOG_POLE_B = A1;   // полюс B мотора
+const uint8_t PIN_ANALOG_POLE_A = A1;   // полюс A мотора
+const uint8_t PIN_ANALOG_POLE_B = A2;   // полюс B мотора
 
-const uint8_t PIN_RC_VT = 2;
-const uint8_t PIN_RC_D0 = 3;
-const uint8_t PIN_RC_D1 = 4;
-const uint8_t PIN_RC_D2 = 5;
-const uint8_t PIN_RC_D3 = 6;
+const uint8_t PIN_RC_VT = 12;
+const uint8_t PIN_RC_D0 = 8;
+const uint8_t PIN_RC_D1 = 9;
+const uint8_t PIN_RC_D2 = 11;
+const uint8_t PIN_RC_D3 = 10;
 
-const uint8_t PIN_OUT_BRAKE = 7;    // тормозная нагрузка (при спаде)
-const uint8_t PIN_OUT_AUX   = 8;    // вторая нагрузка (по направлению)
-const uint8_t PIN_OUT_FL = 9;
-const uint8_t PIN_OUT_TL = 10;
-const uint8_t PIN_OUT_TR = 11;
+const uint8_t PIN_OUT_BRAKE = 7;    // тормоз
+const uint8_t PIN_OUT_AUX   = 5;    // задний Ход
+const uint8_t PIN_OUT_FL = 4;
+const uint8_t PIN_OUT_TL = 3;
+const uint8_t PIN_OUT_TR = 2;
 
 // --- Аналоговый делитель ---
 const float DIVIDER_RATIO = 0.3197;   // R2/(R1+R2)
