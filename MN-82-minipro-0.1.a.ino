@@ -11,10 +11,10 @@ const uint8_t PIN_ANALOG_POLE_A = A1;   // полюс A мотора
 const uint8_t PIN_ANALOG_POLE_B = A2;   // полюс B мотора
 
 const uint8_t PIN_RC_VT = 12;
-const uint8_t PIN_RC_D0 = 8;
-const uint8_t PIN_RC_D1 = 9;
-const uint8_t PIN_RC_D2 = 11;
-const uint8_t PIN_RC_D3 = 10;
+const uint8_t PIN_RC_D0 = 10;//8
+const uint8_t PIN_RC_D1 = 11;//9
+const uint8_t PIN_RC_D2 = 9;//11
+const uint8_t PIN_RC_D3 = 8;//10
 
 const uint8_t PIN_OUT_BRAKE = 7;    // тормоз
 const uint8_t PIN_OUT_AUX   = 5;    // задний Ход
