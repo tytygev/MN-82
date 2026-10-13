@@ -27,15 +27,16 @@ const float DIVIDER_RATIO = 0.3197;   // R2/(R1+R2)
 const float VREF = 5.0;
 
 // --- Параметры детектора быстрого спада ---
-const float MIN_DROP_RATE = 1.0;               // минимальная скорость падения, В/с
-const unsigned long MIN_DROP_DURATION_MS = 500; // мин. длительность быстрого падения
+const float MIN_DROP_RATE = 0.50;               // минимальная скорость падения, В/с
+const unsigned long MIN_DROP_DURATION_MS = 50; // мин. длительность быстрого падения
 const unsigned long MAX_LOAD_TIME_MS = 10000;   // макс. время удержания тормоза
 const float CUTOFF_VOLTAGE = 0.5;               // порог отсечки (В)
 const unsigned long CUTOFF_HOLD_MS = 10000;     // задержка после падения ниже порога
-const unsigned long UPDATE_INTERVAL_MS = 20;    // период обновления детектора
+const unsigned long UPDATE_INTERVAL_MS = 10;    // период обновления детектора
 
 // --- Порог для определения направления вращения ---
-const float DIRECTION_THRESHOLD = 0.5;  // минимальная разность напряжений (В)
+const float DIRECTION_THRESHOLD = 0.1;		// минимальная разность напряжений (В)
+const unsigned long LAMP_HOLD_MS = 5000;	// задержка выключения
 
 // --- Параметры RC-каналов (ШИМ) ---
 //const unsigned long MIN_PULSE = 1000;
@@ -102,53 +103,53 @@ class VoltageDropDetector {
     }
 
     void update() {
-  unsigned long now = millis();
-  if (now - _lastUpdate < _updateInterval) return;
-  _lastUpdate = now;
+		unsigned long now = millis();
+		if (now - _lastUpdate < _updateInterval) return;
+		_lastUpdate = now;
+		
+		float voltage = readVoltage();
+		float dt = (now - _lastTime) / 1000.0;
+		float dv = voltage - _lastVoltage;
+		float rate = dv / dt;
+		
+		// Проверка быстрого спада
+		if (rate < -_minDropRate) {
+		_dropDuration += (now - _lastTime);
+		} else {
+		_dropDuration = 0;
+		}
+		
+		// Включение нагрузки при выполнении условий
+		if (!_loadActive && _dropDuration >= _minDropDuration && voltage > _cutoffVoltage) {
+		_loadActive = true;
+		_cutoffEntered = false;
+		}
+		
+        // Обработка выключения
+        if (_loadActive) {
+          // Условие 1: напряжение перестало падать (rate >= 0)
+          if (rate >= 0) {
+            _loadActive = false;
+          }
+          // Условие 2: напряжение ниже порога и прошло время удержания
+          else if (voltage < _cutoffVoltage) {
+            if (!_cutoffEntered) {
+              _cutoffEntered = true;
+              _cutoffEnterTime = now;
+            } else if (now - _cutoffEnterTime >= _cutoffHoldTime) {
+              _loadActive = false;
+            }
+          }
+        
+          // Сброс таймера отсечки, если напряжение снова поднялось выше порога
+          if (voltage >= _cutoffVoltage && _cutoffEntered) {
+            _cutoffEntered = false;
+          }
+        }
 
-  float voltage = readVoltage();
-  float dt = (now - _lastTime) / 1000.0;
-  float dv = voltage - _lastVoltage;
-  float rate = dv / dt;
-
-  // Проверка быстрого спада
-  if (rate < -_minDropRate) {
-    _dropDuration += (now - _lastTime);
-  } else {
-    _dropDuration = 0;
-  }
-
-  // Включение нагрузки при выполнении условий
-  if (!_loadActive && _dropDuration >= _minDropDuration && voltage > _cutoffVoltage) {
-    _loadActive = true;
-    _cutoffEntered = false;
-  }
-
-  // Обработка выключения
-  if (_loadActive) {
-    // Условие 1: напряжение перестало падать (rate >= 0)
-    if (rate >= 0) {
-      _loadActive = false;
-    }
-    // Условие 2: напряжение ниже порога и прошло время удержания
-    else if (voltage < _cutoffVoltage) {
-      if (!_cutoffEntered) {
-        _cutoffEntered = true;
-        _cutoffEnterTime = now;
-      } else if (now - _cutoffEnterTime >= _cutoffHoldTime) {
-        _loadActive = false;
-      }
-    }
-
-    // Сброс таймера отсечки, если напряжение снова поднялось выше порога
-    if (voltage >= _cutoffVoltage && _cutoffEntered) {
-      _cutoffEntered = false;
-    }
-  }
-
-  _lastVoltage = voltage;
-  _lastTime = now;
-}
+		_lastVoltage = voltage;
+		_lastTime = now;
+	}
 
     bool isLoadActive() const { return _loadActive; }
     float getLastVoltage() const { return _lastVoltage; }
@@ -230,6 +231,7 @@ class PulseGenerator {
       }
     }
 };
+
 // 4. Главный контроллер
 class MainController {
   private:
@@ -263,8 +265,8 @@ class MainController {
           RCChannel(PIN_RC_D3)
         },
         _outputs{
-          OutputController(PIN_OUT_BRAKE),  // 0 – тормозная нагрузка
-          OutputController(PIN_OUT_AUX),    // 1 – вторая нагрузка (по направлению)
+          OutputController(PIN_OUT_BRAKE),  // 0 – Стоп-сигналы
+          OutputController(PIN_OUT_AUX),    // 1 – огни заднего хода
           OutputController(PIN_OUT_FL),      // 2 – птф
           OutputController(PIN_OUT_TL),      // 3 – ЛПП
           OutputController(PIN_OUT_TR)       // 4 – ППП
@@ -291,15 +293,19 @@ class MainController {
       _poleADetector.update();
       _poleBDetector.update();
 
-      // --- Управление тормозной нагрузкой ---
-      // Если спад обнаружен на любом полюсе – включаем тормоз
+      // --- Управление стоп-фарами ---
+      // Если спад обнаружен на любом полюсе – включаем стоп-фары
+	  
+	  // Необходимо доработать:
+	  // эта часть не работает совсем. для диагностики проблемы необходимо добавить подробное понятное логгирование в монитор порта
+	  // и тут необходимо проверить работоспособность в случае ШИМ сигнала (фары заднего хода мигают при невысокой скорости вращения)
       if (_poleADetector.isLoadActive() || _poleBDetector.isLoadActive()) {
         _outputs[0].on();
       } else {
         _outputs[0].off();
-      }
+      }	
 
-      // --- Управление второй нагрузкой (по направлению вращения) ---
+      // --- Управление огнями заднего хода (по направлению вращения) ---
       // Простая логика: сравниваем напряжения на полюсах.
       // Если разность превышает порог – мотор крутится в одну сторону,
       // иначе – в другую (или стоит).
@@ -314,7 +320,10 @@ class MainController {
       } else if (diff < -DIRECTION_THRESHOLD) {
         _outputs[1].off();// Обратное направление – можно выключить или оставить выключенным
       } else {
-        _outputs[1].off();// Мотор остановлен или разность мала – выключаем
+        _outputs[1].off();// Мотор остановлен или разность мала – выключаем 
+		
+		// Необходимо доработать:
+		// сюда или в класс необходимо добавить задержку выключения LAMP_HOLD_MS для случая, когда мотор не поменял направление вращения, а был например остановлен
       }
 
       // Обновляем генераторы мигания (независимо)
@@ -362,7 +371,11 @@ class MainController {
         case 4: // D3 – аварийная сигнализация (кнопка-переключатель)
             _tlrFlag = !_tlrFlag;
             if (_tlrFlag) {
-                // Включаем оба поворотника, запоминаем, что аварийка активна
+                // Необходимо доработать:
+				// при включении аварийки периодически правый и левый поворотнике начинают мигать в противофазе.
+				// необходимо оставить логику управления рычагами, но переписать класс блинкера так, чтобы класс имитировал реле тока в автомобиле, 
+				// при включении любого рычага или кнопки аварийки он начинал генерировать импульсы в соотвествии с параметрами.
+				// иными словами, машина состояний правого и левого блинкера должна быть общей для обоих, чтобы исключить саму возможность рассинхрона
                 _blinkerL.enable();
                 _blinkerR.enable();
                 // Флаги рычага не сбрасываем – они сохранят положение рычага
