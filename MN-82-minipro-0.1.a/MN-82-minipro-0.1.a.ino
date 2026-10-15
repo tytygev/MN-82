@@ -56,15 +56,18 @@ const unsigned long BLINK1_OFF_MS = 350;  // время выключения (м
 const unsigned long LOG_INTERVAL_MS = 500;
 
 // === ЗАДАЧА А: параметры контроллера стоп-сигналов ===
-const float STOP_RATE_THRESHOLD = 1.0;         // порог спада среднего (В/с)
-                                                // ниже — ловим даже плавный сброс газа;
-                                                // шум АЦП после усреднения ~0.008 В/с, запас 100x
+const float STOP_RATE_THRESHOLD = 0.5;         // порог спада среднего (В/с)
+                                                // шум mean за окно 500 мс ~±0.15 В → ±0.3 В/с
+                                                // порог 0.5 не триггерится на шум, но ловит реальный сброс газа
 const unsigned long STOP_OFF_DELAY_MS = 100;   // задержка перед выключением после прекращения торможения
 const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
-const float STOP_MOVE_THRESHOLD = 0.3;          // порог «машина движется» по мгновенному vmax (В)
-const unsigned long STOP_SAMPLE_INTERVAL_MS = 100; // окно усреднения (мс)
-                                                   // должно быть больше периода ШИМ,
-                                                   // чтобы среднее не «дёргалось» на его паузах
+const float STOP_MOVE_THRESHOLD = 1.0;          // порог «машина движется» по СРЕДНЕМУ (В)
+                                                // при среднем газе mean ≈ 2.2 В > 1.0 → moving
+                                                // при остановке mean = 0 → stopped
+const unsigned long STOP_SAMPLE_INTERVAL_MS = 500; // окно усреднения (мс)
+                                                    // больше периода ШИМ → mean стабильно,
+                                                    // rate не скачет от фазы ШИМ
+
 // ==================== КЛАССЫ ====================
 
 // 1. Класс детектора быстрого спада напряжения
@@ -381,24 +384,23 @@ class ReverseLightController {
 };
 
 // === ЗАДАЧА А: Контроллер стоп-сигналов ===
-// Вход — ШИМ. Peak-hold был слеп к скважности: пока ШИМ импульсирует,
-// пик не меняется, и плавные изменения газа не видны.
-// Решение: считаем СРЕДНЕЕ vmax за окно — оно линейно пропорционально
-// скважности ШИМ, то есть средней мощности на моторе.
-// Моментальное ON на спаде среднего, 1 с задержки OFF, таймаут 120 с.
+// ШИМ медленный: период сопоставим или больше 100 мс.
+// Короткое окно усреднения ловит случайную фазу ШИМ (mean скачет 0.4...3.6).
+// Решение: окно усреднения 500 мс — гарантированно больше одного периода ШИМ.
+// Оценка «машина движется» — по СРЕДНЕМУ за окно, не по мгновенному vmax.
 class StopLightController {
   private:
     OutputController* _output;
     float _rateThreshold;             // порог по скорости спада среднего (В/с)
     unsigned long _offDelayMs;        // задержка перед выключением
     unsigned long _timeoutMs;         // максимальное удержание
-    float _moveThreshold;             // порог «машина движется» (по мгновенному vmax)
+    float _moveThreshold;             // порог «машина движется» ПО СРЕДНЕМУ (В)
     unsigned long _sampleIntervalMs;  // окно усреднения
 
     float _sumVmax;                   // накопление vmax в текущем окне
     unsigned long _countVmax;         // количество сэмплов в текущем окне
     float _lastAvg;                   // среднее предыдущего окна
-    float _currentAvg;                // среднее текущего окна (последнее посчитанное)
+    float _currentAvg;                // среднее текущего окна
     unsigned long _lastSampleTime;    // момент начала текущего окна
     unsigned long _lastBrakeTime;     // момент последнего подтверждённого торможения
     bool _on;
@@ -441,8 +443,7 @@ class StopLightController {
         unsigned long dt = now - _lastSampleTime;
         float rate = (avg - _lastAvg) * 1000.0 / dt;
 
-        // Реальное торможение: среднее упало ниже порога.
-        // Даже плавный сброс газа даёт rate порядка −1…−4 В/с, что выше порога 1.0.
+        // Торможение: среднее упало быстрее порога.
         if (rate < -_rateThreshold) {
           _lastBrakeTime = now;
           if (!_on) {
@@ -451,20 +452,20 @@ class StopLightController {
           }
         }
 
-        // Сброс окна
         _lastAvg = avg;
         _sumVmax = 0;
         _countVmax = 0;
         _lastSampleTime = now;
       }
 
-      // === 3. OFF-условие — проверяем каждый цикл ===
-      // «Движется» — по мгновенному vmax: плотный опрос ловит даже короткие
-      // импульсы ШИМ, поэтому ложных «стою» при движении не будет.
+      // === 3. OFF-условие ===
+      // «Машина движется» — по СРЕДНЕМУ, а не по мгновенному vmax.
+      // Среднее стабильно и не подвержено фазе ШИМ, поэтому ложных
+      // «стою» при движении не будет даже на малом газу.
       if (_on) {
         bool offDelayPassed = (now - _lastBrakeTime > _offDelayMs);
         bool timeoutPassed  = (now - _lastBrakeTime > _timeoutMs);
-        bool moving         = (vmax > _moveThreshold);
+        bool moving         = (_currentAvg > _moveThreshold);
 
         if (offDelayPassed && (moving || timeoutPassed)) {
           _on = false;
