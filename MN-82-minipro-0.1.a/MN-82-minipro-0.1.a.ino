@@ -53,7 +53,12 @@ const unsigned long BLINK1_ON_MS  = 350;  // время включения (мс
 const unsigned long BLINK1_OFF_MS = 350;  // время выключения (мс)
 // === ЗАДАЧА А: интервал вывода логов в монитор порта ===
 const unsigned long LOG_INTERVAL_MS = 500;
-
+// === ЗАДАЧА А: параметры контроллера стоп-сигналов ===
+const float STOP_RATE_THRESHOLD = 8.0;         // порог срабатывания по скорости спада (В/с)
+                                                // в 5 раз выше шума АЦП (1.53 В/с) и в 5 раз ниже реального торможения (40+)
+const unsigned long STOP_OFF_DELAY_MS = 1000;   // задержка перед выключением после прекращения торможения
+const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
+const float STOP_MOVE_THRESHOLD = 1.0;          // порог «машина движется» (В)
 
 // ==================== КЛАССЫ ====================
 
@@ -170,6 +175,81 @@ class VoltageDropDetector {
     float getPeakMax() const { return _peakMax; }
     unsigned long getDropDuration() const { return _dropDuration; }
     void resetPeaks() { _peakMin = 999.0; _peakMax = 0.0; }  // вызывать после логирования
+};
+
+// === ЗАДАЧА А: Контроллер стоп-сигналов ===
+// Логика под требования:
+//   - Включение МОМЕНТАЛЬНОЕ при первом сэмпле ниже порога (раньше некуда).
+//   - Выключение через STOP_OFF_DELAY_MS после прекращения торможения.
+//   - Максимальное удержание STOP_TIMEOUT_MS (120 с) от последнего события торможения.
+// Работает по уровню max(|A|, |B|) — отслеживает и прямой ход, и задний.
+class StopLightController {
+  private:
+    OutputController* _output;
+    float _rateThreshold;       // порог по скорости спада (В/с)
+    unsigned long _offDelayMs;  // задержка перед выключением после торможения
+    unsigned long _timeoutMs;   // максимальное удержание
+    float _moveThreshold;       // порог «машина движется»
+
+    float _lastVmax;            // предыдущее значение max(|A|, |B|)
+    unsigned long _lastSampleTime;
+    unsigned long _lastBrakeTime;  // момент последнего подтверждённого торможения
+    bool _on;
+
+  public:
+    StopLightController(OutputController* output, float rateThreshold,
+                        unsigned long offDelayMs, unsigned long timeoutMs,
+                        float moveThreshold)
+      : _output(output), _rateThreshold(rateThreshold),
+        _offDelayMs(offDelayMs), _timeoutMs(timeoutMs),
+        _moveThreshold(moveThreshold),
+        _lastVmax(0), _lastSampleTime(0),
+        _lastBrakeTime(0), _on(false) {}
+
+    void begin() {
+      _output->off();
+      _lastVmax = 0;
+      _lastSampleTime = millis();
+      _lastBrakeTime = 0;
+      _on = false;
+    }
+
+    void update(float voltageA, float voltageB) {
+      unsigned long now = millis();
+
+      // Считаем vmax и его производную
+      float vmax = max(fabs(voltageA), fabs(voltageB));
+      unsigned long dt = now - _lastSampleTime;
+      float rate = 0.0;
+      if (dt > 0) {
+        rate = (vmax - _lastVmax) * 1000.0 / dt;
+      }
+      _lastVmax = vmax;
+      _lastSampleTime = now;
+
+      // 1. Моментальное включение при спаде ниже порога
+      if (rate < -_rateThreshold) {
+        _lastBrakeTime = now;
+        if (!_on) {
+          _on = true;
+          _output->on();
+        }
+      }
+
+      // 2. Выключение с задержкой 1 с
+      if (_on) {
+        bool noBrakeFor1s = (now - _lastBrakeTime > _offDelayMs);
+        bool timeout      = (now - _lastBrakeTime > _timeoutMs);
+        bool moving       = (vmax > _moveThreshold);
+
+        if (noBrakeFor1s && (moving || timeout)) {
+          _on = false;
+          _output->off();
+        }
+      }
+    }
+
+    bool isOn() const { return _on; }
 };
 
 // 2. Класс для чтения цифрового канала приёмника (RC)
@@ -378,6 +458,7 @@ class MainController {
     OutputController _outputs[5];
     DualBlinker _blinkers;   // ЗАДАЧА В: единый контроллер обоих поворотников
     ReverseLightController _reverseLight;   // ЗАДАЧА Б: контроллер огней ЗХ
+    StopLightController _stopLight;         // ЗАДАЧА А: контроллер стоп-сигналов
     bool _tfFlag = false;
     bool _tlFlag = false;
     bool _trFlag = false;
@@ -410,7 +491,9 @@ class MainController {
           OutputController(PIN_OUT_TR)       // 4 – ППП
         },
         _blinkers(&_outputs[3], &_outputs[4], BLINK1_ON_MS, BLINK1_OFF_MS),
-        _reverseLight(&_outputs[1], DIRECTION_THRESHOLD, LAMP_HOLD_MS, LAMP_HYSTERESIS_MS)
+        _reverseLight(&_outputs[1], DIRECTION_THRESHOLD, LAMP_HOLD_MS, LAMP_HYSTERESIS_MS),
+        _stopLight(&_outputs[0], STOP_RATE_THRESHOLD, STOP_OFF_DELAY_MS,
+                   STOP_TIMEOUT_MS, STOP_MOVE_THRESHOLD)
     {}
 
     void begin() {
@@ -422,6 +505,7 @@ class MainController {
       }
       _blinkers.begin();   // ЗАДАЧА В
       _reverseLight.begin();   // ЗАДАЧА Б
+      _stopLight.begin();      // ЗАДАЧА А
       Serial.begin(115200);  // ЗАДАЧА А: увеличено, чтобы вывод логов не блокировал цикл
       Serial.println(F("System initialized"));
     }
@@ -431,13 +515,11 @@ class MainController {
       _poleADetector.update();
       _poleBDetector.update();
 
-      // --- Управление стоп-фарами ---
-      // Если спад обнаружен на любом полюсе – включаем стоп-фары
-      if (_poleADetector.isLoadActive() || _poleBDetector.isLoadActive()) {
-        _outputs[0].on();
-      } else {
-        _outputs[0].off();
-      }
+      // --- Управление стоп-фарами (ЗАДАЧА А: моментальное ON, 1 с задержка OFF) ---
+      // Логика вынесена в StopLightController. Работает по уровням vmax и rate,
+      // моментально включает при спаде и держит после остановки до 120 с.
+      _stopLight.update(_poleADetector.getLastVoltage(),
+                        _poleBDetector.getLastVoltage());
 
       // === ЗАДАЧА А: подробное логирование детекторов ===
       // Каждые LOG_INTERVAL_MS выводим реальные значения rate и пиков напряжения.
@@ -460,8 +542,7 @@ class MainController {
         Serial.print(F(" drop="));   Serial.print(_poleBDetector.getDropDuration());
         Serial.print(F(" act="));    Serial.print(_poleBDetector.isLoadActive() ? 1 : 0);
 
-        bool stopOn = (_poleADetector.isLoadActive() || _poleBDetector.isLoadActive());
-        Serial.print(F(" || STOP=")); Serial.println(stopOn ? 1 : 0);
+        Serial.print(F(" || STOP=")); Serial.println(_stopLight.isOn() ? 1 : 0);
 
         // Сбрасываем пики для следующего окна логирования
         _poleADetector.resetPeaks();
