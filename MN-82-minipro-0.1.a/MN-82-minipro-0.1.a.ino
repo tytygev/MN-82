@@ -1,4 +1,4 @@
-// ============================================================
+  // ============================================================
 //  СКЕТЧ УПРАВЛЕНИЯ НАГРУЗКОЙ ПО СПАДУ НАПРЯЖЕНИЯ НА ПОЛЮСАХ МОТОРА
 //  Один мотор, два аналоговых входа (полюса A и B),
 //  одна тормозная нагрузка (при спаде на любом полюсе),
@@ -35,8 +35,9 @@ const unsigned long CUTOFF_HOLD_MS = 10000;     // задержка после �
 const unsigned long UPDATE_INTERVAL_MS = 10;    // период обновления детектора
 
 // --- Порог для определения направления вращения ---
-const float DIRECTION_THRESHOLD = 0.1;		// минимальная разность напряжений (В)
-const unsigned long LAMP_HOLD_MS = 5000;	// задержка выключения
+const float DIRECTION_THRESHOLD = 0.1;          // минимальная разность напряжений (В)
+const unsigned long LAMP_HOLD_MS = 60000;       // ЗАДАЧА Б: удержание огней ЗХ после пропадания реверса (60 с)
+const unsigned long LAMP_HYSTERESIS_MS = 500;   // ЗАДАЧА Б: игнорировать пропадания реверса короче этого времени
 
 // --- Параметры RC-каналов (ШИМ) ---
 //const unsigned long MIN_PULSE = 1000;
@@ -50,6 +51,8 @@ const unsigned long LAMP_HOLD_MS = 5000;	// задержка выключени�
 // --- Параметры мигания ---
 const unsigned long BLINK1_ON_MS  = 350;  // время включения (мс)
 const unsigned long BLINK1_OFF_MS = 350;  // время выключения (мс)
+// === ЗАДАЧА А: интервал вывода логов в монитор порта ===
+const unsigned long LOG_INTERVAL_MS = 500;
 
 
 // ==================== КЛАССЫ ====================
@@ -75,6 +78,10 @@ class VoltageDropDetector {
     unsigned long _loadStartTime;
     bool _cutoffEntered;
     unsigned long _cutoffEnterTime;
+    // === ЗАДАЧА А: переменные для диагностики ===
+    float _lastRate;   // последняя вычисленная скорость изменения (В/с)
+    float _peakMin;    // минимум напряжения с момента последнего resetPeaks()
+    float _peakMax;    // максимум напряжения с момента последнего resetPeaks()
 
   public:
     VoltageDropDetector(uint8_t pin, float dividerRatio, float vref,
@@ -87,7 +94,8 @@ class VoltageDropDetector {
         _cutoffHoldTime(cutoffHoldTime), _updateInterval(updateInterval),
         _lastVoltage(0), _lastTime(0), _lastUpdate(0),
         _dropDuration(0), _loadActive(false), _loadStartTime(0),
-        _cutoffEntered(false), _cutoffEnterTime(0) {}
+        _cutoffEntered(false), _cutoffEnterTime(0),
+        _lastRate(0), _peakMin(999.0), _peakMax(0.0) {}
 
     void begin() {
       pinMode(_pin, INPUT);
@@ -111,6 +119,9 @@ class VoltageDropDetector {
 		float dt = (now - _lastTime) / 1000.0;
 		float dv = voltage - _lastVoltage;
 		float rate = dv / dt;
+		_lastRate = rate;                            // ЗАДАЧА А: сохраняем для логирования
+		if (voltage < _peakMin) _peakMin = voltage;  // ЗАДАЧА А: трекинг минимума
+		if (voltage > _peakMax) _peakMax = voltage;  // ЗАДАЧА А: трекинг максимума
 		
 		// Проверка быстрого спада
 		if (rate < -_minDropRate) {
@@ -153,6 +164,12 @@ class VoltageDropDetector {
 
     bool isLoadActive() const { return _loadActive; }
     float getLastVoltage() const { return _lastVoltage; }
+    // === ЗАДАЧА А: геттеры для диагностики ===
+    float getLastRate() const { return _lastRate; }
+    float getPeakMin() const { return _peakMin; }
+    float getPeakMax() const { return _peakMax; }
+    unsigned long getDropDuration() const { return _dropDuration; }
+    void resetPeaks() { _peakMin = 999.0; _peakMax = 0.0; }  // вызывать после логирования
 };
 
 // 2. Класс для чтения цифрового канала приёмника (RC)
@@ -187,47 +204,167 @@ class OutputController {
     void set(bool state) { state ? on() : off(); }
 };
 
-// Генератор импульсов (мигание)
-class PulseGenerator {
+// === ЗАДАЧА В: Синхронный контроллер двух поворотников ===
+// Один общий таймер — противофаза физически невозможна.
+// Каждый поворотник включается независимо (рычагом) + есть общий режим "аварийка".
+class DualBlinker {
   private:
-    OutputController* _output;    // указатель на управляемый выход
-    unsigned long _onTime;
-    unsigned long _offTime;
-    unsigned long _lastToggle;
-    bool _currentState;
-    bool _enabled;
+    OutputController* _left;      // левый поворотник
+    OutputController* _right;     // правый поворотник
+    unsigned long _onTime;        // длительность свечения (мс)
+    unsigned long _offTime;       // длительность паузы (мс)
+
+    bool _leftEnabled;            // левый включён рычагом
+    bool _rightEnabled;           // правый включён рычагом
+    bool _hazardEnabled;          // включена аварийка
+
+    unsigned long _lastToggle;    // момент последнего переключения
+    bool _currentState;           // фаза: true=горит, false=пауза
+    bool _timerRunning;           // работает ли таймер
 
   public:
-    // конструктор
-    PulseGenerator(OutputController* output, unsigned long onMs, unsigned long offMs)
-      : _output(output), _onTime(onMs), _offTime(offMs),
-        _lastToggle(0), _currentState(false), _enabled(false) {}
+    DualBlinker(OutputController* left, OutputController* right,
+                unsigned long onMs, unsigned long offMs)
+      : _left(left), _right(right),
+        _onTime(onMs), _offTime(offMs),
+        _leftEnabled(false), _rightEnabled(false), _hazardEnabled(false),
+        _lastToggle(0), _currentState(false), _timerRunning(false) {}
 
     void begin() {
-      _lastToggle = millis();
-      _output->off();
-      _enabled = false; // или по умолчанию включено
+      _left->off();
+      _right->off();
     }
 
-    void enable()  { _enabled = true;  _lastToggle = millis(); _output->off(); }
-    void disable() { _enabled = false; _output->off(); }
+    // Управление режимами. Только выставляют флаг — таймер подхватит в update().
+    void enableLeft()   { _leftEnabled = true;   }
+    void disableLeft()  { _leftEnabled = false;  }
+    void enableRight()  { _rightEnabled = true;  }
+    void disableRight() { _rightEnabled = false; }
+    void enableHazard() { _hazardEnabled = true;  }
+    void disableHazard(){ _hazardEnabled = false; }
 
     void update() {
-      if (!_enabled) return;
-
       unsigned long now = millis();
-      if (_currentState) {
-        if (now - _lastToggle >= _onTime) {
+
+      bool anythingEnabled = _leftEnabled || _rightEnabled || _hazardEnabled;
+
+      // Ничего не включено — гасим оба выхода и сбрасываем таймер
+      if (!anythingEnabled) {
+        if (_timerRunning || _currentState) {
           _currentState = false;
-          _output->off();
-          _lastToggle = now;
+          _timerRunning = false;
+          _updateOutputs();
         }
-      } else {
-        if (now - _lastToggle >= _offTime) {
-          _currentState = true;
-          _output->on();
-          _lastToggle = now;
-        }
+        return;
+      }
+
+      // Первый запуск — стартуем с включённого состояния
+      if (!_timerRunning) {
+        _timerRunning = true;
+        _currentState = true;
+        _lastToggle = now;
+        _updateOutputs();
+        return;
+      }
+
+      // Продолжаем мигать
+      unsigned long interval = _currentState ? _onTime : _offTime;
+      if (now - _lastToggle >= interval) {
+        _currentState = !_currentState;
+        _lastToggle = now;
+        _updateOutputs();
+      }
+    }
+
+  private:
+    void _updateOutputs() {
+      // Левый горит, если (левый включён рычагом ИЛИ аварийка) И фаза = "горит"
+      bool leftOn  = _currentState && (_leftEnabled  || _hazardEnabled);
+      bool rightOn = _currentState && (_rightEnabled || _hazardEnabled);
+      if (leftOn)  _left->on();  else _left->off();
+      if (rightOn) _right->on(); else _right->off();
+    }
+};
+
+// === ЗАДАЧА Б: Контроллер огней заднего хода ===
+// Логика:
+//   - diff > +threshold  (мотор крутится назад)   -> огни ВКЛ, сбрасываем таймер
+//   - diff < -threshold  (мотор крутится вперёд)  -> огни ВЫКЛ немедленно
+//   - промежуточное состояние (стоп или ШИМ-пауза):
+//       * если прошло < _hysteresisMs с последнего реверса — продолжаем гореть
+//         (защита от дребезга ШИМ на низкой скорости)
+//       * иначе запускается 60-секундный таймер удержания
+//       * по истечении _holdMs огни гаснут
+class ReverseLightController {
+  private:
+    OutputController* _output;      // управляемый выход
+    float _threshold;               // порог разности напряжений (В)
+    unsigned long _holdMs;          // удержание после остановки (мс)
+    unsigned long _hysteresisMs;    // игнорирование коротких провалов ШИМ (мс)
+
+    enum State { OFF, REVERSE, HOLD };
+    State _state;
+    unsigned long _lastReverseSeen; // последний момент, когда diff > threshold
+
+  public:
+    ReverseLightController(OutputController* output, float threshold,
+                           unsigned long holdMs, unsigned long hysteresisMs)
+      : _output(output), _threshold(threshold),
+        _holdMs(holdMs), _hysteresisMs(hysteresisMs),
+        _state(OFF), _lastReverseSeen(0) {}
+
+    void begin() {
+      _output->off();
+      _state = OFF;
+      _lastReverseSeen = 0;
+    }
+
+    void update(float diff) {
+      unsigned long now = millis();
+
+      bool clearReverse = (diff >  _threshold);  // явный реверс
+      bool clearForward = (diff < -_threshold);  // явный ход вперёд
+
+      if (clearReverse) {
+        _lastReverseSeen = now;  // каждое подтверждение реверса обновляет таймер
+      }
+
+      switch (_state) {
+        case OFF:
+          if (clearReverse) {
+            _state = REVERSE;
+            _output->on();
+          }
+          break;
+
+        case REVERSE:
+          if (clearForward) {
+            // Резкая смена направления — гасим немедленно
+            _state = OFF;
+            _output->off();
+          } else if (!clearReverse && (now - _lastReverseSeen > _hysteresisMs)) {
+            // Сигнал реверса пропал и не вернулся за время гистерезиса
+            // Переходим в режим удержания — огни продолжают гореть
+            _state = HOLD;
+          }
+          // иначе — всё ещё в реверсе, оставляем гореть
+          break;
+
+        case HOLD:
+          if (clearReverse) {
+            // Мотор снова крутится назад
+            _state = REVERSE;
+          } else if (clearForward) {
+            // Мотор крутится вперёд — гасим
+            _state = OFF;
+            _output->off();
+          } else if (now - _lastReverseSeen > _hysteresisMs + _holdMs) {
+            // 60 с истекли — гасим
+            _state = OFF;
+            _output->off();
+          }
+          // иначе — огни продолжают гореть в фоне
+          break;
       }
     }
 };
@@ -239,13 +376,14 @@ class MainController {
     VoltageDropDetector _poleBDetector;
     RCChannel _rcChannels[5];
     OutputController _outputs[5];
-    PulseGenerator _blinkerL;
-    PulseGenerator _blinkerR;
+    DualBlinker _blinkers;   // ЗАДАЧА В: единый контроллер обоих поворотников
+    ReverseLightController _reverseLight;   // ЗАДАЧА Б: контроллер огней ЗХ
     bool _tfFlag = false;
     bool _tlFlag = false;
     bool _trFlag = false;
     bool _tlrFlag = false;
     bool _prevChannelState[5] = {false, false, false, false, false};
+    unsigned long _lastLogTime = 0;   // ЗАДАЧА А: момент последнего вывода логов
 
   public:
     MainController()
@@ -271,8 +409,8 @@ class MainController {
           OutputController(PIN_OUT_TL),      // 3 – ЛПП
           OutputController(PIN_OUT_TR)       // 4 – ППП
         },
-        _blinkerL(&_outputs[3], BLINK1_ON_MS, BLINK1_OFF_MS),
-        _blinkerR(&_outputs[4], BLINK1_ON_MS, BLINK1_OFF_MS)
+        _blinkers(&_outputs[3], &_outputs[4], BLINK1_ON_MS, BLINK1_OFF_MS),
+        _reverseLight(&_outputs[1], DIRECTION_THRESHOLD, LAMP_HOLD_MS, LAMP_HYSTERESIS_MS)
     {}
 
     void begin() {
@@ -282,9 +420,9 @@ class MainController {
         _rcChannels[i].begin();
         _outputs[i].begin();
       }
-      _blinkerL.begin();
-      _blinkerR.begin();
-      Serial.begin(9600);
+      _blinkers.begin();   // ЗАДАЧА В
+      _reverseLight.begin();   // ЗАДАЧА Б
+      Serial.begin(115200);  // ЗАДАЧА А: увеличено, чтобы вывод логов не блокировал цикл
       Serial.println(F("System initialized"));
     }
 
@@ -295,40 +433,52 @@ class MainController {
 
       // --- Управление стоп-фарами ---
       // Если спад обнаружен на любом полюсе – включаем стоп-фары
-	  
-	  // Необходимо доработать:
-	  // эта часть не работает совсем. для диагностики проблемы необходимо добавить подробное понятное логгирование в монитор порта
-	  // и тут необходимо проверить работоспособность в случае ШИМ сигнала (фары заднего хода мигают при невысокой скорости вращения)
       if (_poleADetector.isLoadActive() || _poleBDetector.isLoadActive()) {
         _outputs[0].on();
       } else {
         _outputs[0].off();
-      }	
+      }
+
+      // === ЗАДАЧА А: подробное логирование детекторов ===
+      // Каждые LOG_INTERVAL_MS выводим реальные значения rate и пиков напряжения.
+      // Это позволит подобрать MIN_DROP_RATE осмысленно, а не наугад.
+      unsigned long nowForLog = millis();
+      if (nowForLog - _lastLogTime >= LOG_INTERVAL_MS) {
+        _lastLogTime = nowForLog;
+
+        Serial.print(F("A="));      Serial.print(_poleADetector.getLastVoltage(), 2);
+        Serial.print(F(" pk["));     Serial.print(_poleADetector.getPeakMin(), 2);
+        Serial.print('-');           Serial.print(_poleADetector.getPeakMax(), 2);
+        Serial.print(F("] rate="));  Serial.print(_poleADetector.getLastRate(), 2);
+        Serial.print(F(" drop="));   Serial.print(_poleADetector.getDropDuration());
+        Serial.print(F(" act="));    Serial.print(_poleADetector.isLoadActive() ? 1 : 0);
+
+        Serial.print(F(" || B="));   Serial.print(_poleBDetector.getLastVoltage(), 2);
+        Serial.print(F(" pk["));     Serial.print(_poleBDetector.getPeakMin(), 2);
+        Serial.print('-');           Serial.print(_poleBDetector.getPeakMax(), 2);
+        Serial.print(F("] rate="));  Serial.print(_poleBDetector.getLastRate(), 2);
+        Serial.print(F(" drop="));   Serial.print(_poleBDetector.getDropDuration());
+        Serial.print(F(" act="));    Serial.print(_poleBDetector.isLoadActive() ? 1 : 0);
+
+        bool stopOn = (_poleADetector.isLoadActive() || _poleBDetector.isLoadActive());
+        Serial.print(F(" || STOP=")); Serial.println(stopOn ? 1 : 0);
+
+        // Сбрасываем пики для следующего окна логирования
+        _poleADetector.resetPeaks();
+        _poleBDetector.resetPeaks();
+      }
 
       // --- Управление огнями заднего хода (по направлению вращения) ---
-      // Простая логика: сравниваем напряжения на полюсах.
-      // Если разность превышает порог – мотор крутится в одну сторону,
-      // иначе – в другую (или стоит).
+      // ЗАДАЧА Б: вся логика вынесена в класс ReverseLightController.
+      // Он сам решает, когда зажигать и когда гасить огни, с учётом
+      // гистерезиса (защита от ШИМ) и 60-секундного удержания.
       float voltageA = _poleADetector.getLastVoltage();
       float voltageB = _poleBDetector.getLastVoltage();
       float diff = voltageA - voltageB;
+      _reverseLight.update(diff);
 
-      // Здесь вы можете настроить, какое направление должно включать нагрузку.
-      // В примере включаем, если напряжение на A значительно выше, чем на B.
-      if (diff > DIRECTION_THRESHOLD) {
-        _outputs[1].on();
-      } else if (diff < -DIRECTION_THRESHOLD) {
-        _outputs[1].off();// Обратное направление – можно выключить или оставить выключенным
-      } else {
-        _outputs[1].off();// Мотор остановлен или разность мала – выключаем 
-		
-		// Необходимо доработать:
-		// сюда или в класс необходимо добавить задержку выключения LAMP_HOLD_MS для случая, когда мотор не поменял направление вращения, а был например остановлен
-      }
-
-      // Обновляем генераторы мигания (независимо)
-      _blinkerL.update();
-      _blinkerR.update();
+      // Обновляем генератор мигания (ЗАДАЧА В: один на оба поворотника)
+      _blinkers.update();
 
       // Чтение RC-каналов (при необходимости)
 
@@ -346,14 +496,15 @@ class MainController {
             break;
 
         case 2: // D1 – левый поворотник (положение рычага)
-            // Переключаем левый, при этом правый выключаем всегда
+            // Переключаем левый рычаг. Правый всегда отключаем — на авто
+            // левый и правый не могут быть активны одновременно.
             _tlFlag = !_tlFlag;
             if (_tlFlag) {
-                _trFlag = false;          // правый не может быть активен одновременно
-                if (!_tlrFlag) _blinkerR.disable();// при включённой аварийке игнорируем рычаг
-                if (!_tlrFlag) _blinkerL.enable();// при включённой аварийке игнорируем рычаг
+                _trFlag = false;
+                _blinkers.disableRight();
+                _blinkers.enableLeft();
             } else {
-                if (!_tlrFlag) _blinkerL.disable();// при включённой аварийке игнорируем рычаг
+                _blinkers.disableLeft();
             }
             break;
 
@@ -361,35 +512,31 @@ class MainController {
             _trFlag = !_trFlag;
             if (_trFlag) {
                 _tlFlag = false;
-                if (!_tlrFlag) _blinkerL.disable();// при включённой аварийке игнорируем рычаг
-                if (!_tlrFlag) _blinkerR.enable();// при включённой аварийке игнорируем рычаг
+                _blinkers.disableLeft();
+                _blinkers.enableRight();
             } else {
-                if (!_tlrFlag) _blinkerR.disable();// при включённой аварийке игнорируем рычаг
+                _blinkers.disableRight();
             }
             break;
 
         case 4: // D3 – аварийная сигнализация (кнопка-переключатель)
             _tlrFlag = !_tlrFlag;
             if (_tlrFlag) {
-                // Необходимо доработать:
-				// при включении аварийки периодически правый и левый поворотнике начинают мигать в противофазе.
-				// необходимо оставить логику управления рычагами, но переписать класс блинкера так, чтобы класс имитировал реле тока в автомобиле, 
-				// при включении любого рычага или кнопки аварийки он начинал генерировать импульсы в соотвествии с параметрами.
-				// иными словами, машина состояний правого и левого блинкера должна быть общей для обоих, чтобы исключить саму возможность рассинхрона
-                _blinkerL.enable();
-                _blinkerR.enable();
-                // Флаги рычага не сбрасываем – они сохранят положение рычага
+                // Включаем аварийку. Флаги рычага не трогаем —
+                // они восстановятся при выключении аварийки.
+                _blinkers.enableHazard();
             } else {
                 // Выключаем аварийку и восстанавливаем состояние по флагам рычага
+                _blinkers.disableHazard();
                 if (_tlFlag) {
-                    _blinkerL.enable();
-                    _blinkerR.disable();
+                    _blinkers.enableLeft();
+                    _blinkers.disableRight();
                 } else if (_trFlag) {
-                    _blinkerL.disable();
-                    _blinkerR.enable();
+                    _blinkers.enableRight();
+                    _blinkers.disableLeft();
                 } else {
-                    _blinkerL.disable();
-                    _blinkerR.disable();
+                    _blinkers.disableLeft();
+                    _blinkers.disableRight();
                 }
             }
             break;
@@ -401,8 +548,7 @@ class MainController {
        }
       }
       
-       // Небольшая пауза
-       delay(10);
+
     }
 };
 
