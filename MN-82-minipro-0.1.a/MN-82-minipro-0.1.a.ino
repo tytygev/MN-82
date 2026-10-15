@@ -59,6 +59,7 @@ const float STOP_RATE_THRESHOLD = 8.0;         // порог срабатыва�
 const unsigned long STOP_OFF_DELAY_MS = 1000;   // задержка перед выключением после прекращения торможения
 const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
 const float STOP_MOVE_THRESHOLD = 1.0;          // порог «машина движется» (В)
+const unsigned long STOP_SAMPLE_INTERVAL_MS = 50;  // интервал расчёта rate (мс)
 
 // ==================== КЛАССЫ ====================
 
@@ -376,31 +377,31 @@ class ReverseLightController {
 };
 
 // === ЗАДАЧА А: Контроллер стоп-сигналов ===
-// Логика под требования:
-//   - Включение МОМЕНТАЛЬНОЕ при первом сэмпле ниже порога (раньше некуда).
-//   - Выключение через STOP_OFF_DELAY_MS после прекращения торможения.
-//   - Максимальное удержание STOP_TIMEOUT_MS (120 с) от последнего события торможения.
-// Работает по уровню max(|A|, |B|) — отслеживает и прямой ход, и задний.
+// Ключевая идея: rate вычисляем только раз в STOP_SAMPLE_INTERVAL_MS.
+// Мгновенный rate на интервале 1 мс измеряет шум АЦП, а не скорость мотора.
+// На интервале 50 мс шум АЦП даёт ~0.3 В/с (в 27 раз ниже порога),
+// а реальное торможение — 80+ В/с (в 10 раз выше порога).
 class StopLightController {
   private:
     OutputController* _output;
-    float _rateThreshold;       // порог по скорости спада (В/с)
-    unsigned long _offDelayMs;  // задержка перед выключением после торможения
-    unsigned long _timeoutMs;   // максимальное удержание
-    float _moveThreshold;       // порог «машина движется»
+    float _rateThreshold;             // порог по скорости спада (В/с)
+    unsigned long _offDelayMs;        // задержка перед выключением после торможения
+    unsigned long _timeoutMs;         // максимальное удержание
+    float _moveThreshold;             // порог «машина движется»
+    unsigned long _sampleIntervalMs;  // интервал замера rate (мс)
 
-    float _lastVmax;            // предыдущее значение max(|A|, |B|)
-    unsigned long _lastSampleTime;
-    unsigned long _lastBrakeTime;  // момент последнего подтверждённого торможения
+    float _lastVmax;                  // предыдущее значение max(|A|, |B|) НА МОМЕНТ ЗАМЕРА
+    unsigned long _lastSampleTime;    // момент последнего замера rate
+    unsigned long _lastBrakeTime;     // момент последнего подтверждённого торможения
     bool _on;
 
   public:
     StopLightController(OutputController* output, float rateThreshold,
                         unsigned long offDelayMs, unsigned long timeoutMs,
-                        float moveThreshold)
+                        float moveThreshold, unsigned long sampleIntervalMs)
       : _output(output), _rateThreshold(rateThreshold),
         _offDelayMs(offDelayMs), _timeoutMs(timeoutMs),
-        _moveThreshold(moveThreshold),
+        _moveThreshold(moveThreshold), _sampleIntervalMs(sampleIntervalMs),
         _lastVmax(0), _lastSampleTime(0),
         _lastBrakeTime(0), _on(false) {}
 
@@ -414,33 +415,33 @@ class StopLightController {
 
     void update(float voltageA, float voltageB) {
       unsigned long now = millis();
-
-      // Считаем vmax и его производную
       float vmax = max(fabs(voltageA), fabs(voltageB));
-      unsigned long dt = now - _lastSampleTime;
-      float rate = 0.0;
-      if (dt > 0) {
-        rate = (vmax - _lastVmax) * 1000.0 / dt;
-      }
-      _lastVmax = vmax;
-      _lastSampleTime = now;
 
-      // 1. Моментальное включение при спаде ниже порога
-      if (rate < -_rateThreshold) {
-        _lastBrakeTime = now;
-        if (!_on) {
-          _on = true;
-          _output->on();
+      // === 1. Замер rate — только раз в _sampleIntervalMs ===
+      if (now - _lastSampleTime >= _sampleIntervalMs) {
+        unsigned long dt = now - _lastSampleTime;
+        float rate = (vmax - _lastVmax) * 1000.0 / dt;
+        _lastVmax = vmax;
+        _lastSampleTime = now;
+
+        // ON при спаде ниже порога
+        if (rate < -_rateThreshold) {
+          _lastBrakeTime = now;
+          if (!_on) {
+            _on = true;
+            _output->on();
+          }
         }
       }
 
-      // 2. Выключение с задержкой 1 с
+      // === 2. OFF-условие — проверяем КАЖДЫЙ цикл, по свежему vmax ===
       if (_on) {
-        bool noBrakeFor1s = (now - _lastBrakeTime > _offDelayMs);
-        bool timeout      = (now - _lastBrakeTime > _timeoutMs);
-        bool moving       = (vmax > _moveThreshold);
+        bool offDelayPassed = (now - _lastBrakeTime > _offDelayMs);
+        bool timeoutPassed  = (now - _lastBrakeTime > _timeoutMs);
+        bool moving         = (vmax > _moveThreshold);
 
-        if (noBrakeFor1s && (moving || timeout)) {
+        // Гасим, если: прошло >= 1 с после торможения И (машина снова едет ИЛИ 120 с прошло)
+        if (offDelayPassed && (moving || timeoutPassed)) {
           _on = false;
           _output->off();
         }
@@ -449,7 +450,6 @@ class StopLightController {
 
     bool isOn() const { return _on; }
 };
-
 
 // 4. Главный контроллер
 class MainController {
@@ -495,7 +495,7 @@ class MainController {
         _blinkers(&_outputs[3], &_outputs[4], BLINK1_ON_MS, BLINK1_OFF_MS),
         _reverseLight(&_outputs[1], DIRECTION_THRESHOLD, LAMP_HOLD_MS, LAMP_HYSTERESIS_MS),
         _stopLight(&_outputs[0], STOP_RATE_THRESHOLD, STOP_OFF_DELAY_MS,
-                   STOP_TIMEOUT_MS, STOP_MOVE_THRESHOLD)
+                   STOP_TIMEOUT_MS, STOP_MOVE_THRESHOLD, STOP_SAMPLE_INTERVAL_MS)
     {}
 
     void begin() {
