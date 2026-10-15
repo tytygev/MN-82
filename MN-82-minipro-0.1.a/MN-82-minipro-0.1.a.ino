@@ -51,18 +51,20 @@ const unsigned long LAMP_HYSTERESIS_MS = 500;   // ЗАДАЧА Б: игнори
 // --- Параметры мигания ---
 const unsigned long BLINK1_ON_MS  = 350;  // время включения (мс)
 const unsigned long BLINK1_OFF_MS = 350;  // время выключения (мс)
+
 // === ЗАДАЧА А: интервал вывода логов в монитор порта ===
 const unsigned long LOG_INTERVAL_MS = 500;
-// === ЗАДАЧА А: параметры контроллера стоп-сигналов ===
-const float STOP_RATE_THRESHOLD = 8.0;         // порог срабатывания по скорости спада (В/с)
-                                                // в 5 раз выше шума АЦП (1.53 В/с) и в 5 раз ниже реального торможения (40+)
-const unsigned long STOP_OFF_DELAY_MS = 250;   // задержка перед выключением после прекращения торможения
-const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
-const float STOP_MOVE_THRESHOLD = 0.5;          // порог «машина движется» (В)
-const unsigned long STOP_SAMPLE_INTERVAL_MS = 250; // окно peak-hold (мс)
-                                                   // должно быть больше периода ШИМ,
-                                                   // чтобы окно захватывало хотя бы один полный цикл
 
+// === ЗАДАЧА А: параметры контроллера стоп-сигналов ===
+const float STOP_RATE_THRESHOLD = 1.0;         // порог спада среднего (В/с)
+                                                // ниже — ловим даже плавный сброс газа;
+                                                // шум АЦП после усреднения ~0.008 В/с, запас 100x
+const unsigned long STOP_OFF_DELAY_MS = 100;   // задержка перед выключением после прекращения торможения
+const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
+const float STOP_MOVE_THRESHOLD = 0.3;          // порог «машина движется» по мгновенному vmax (В)
+const unsigned long STOP_SAMPLE_INTERVAL_MS = 100; // окно усреднения (мс)
+                                                   // должно быть больше периода ШИМ,
+                                                   // чтобы среднее не «дёргалось» на его паузах
 // ==================== КЛАССЫ ====================
 
 // 1. Класс детектора быстрого спада напряжения
@@ -379,21 +381,24 @@ class ReverseLightController {
 };
 
 // === ЗАДАЧА А: Контроллер стоп-сигналов ===
-// Ключевая идея: вход — ШИМ, а не постоянное напряжение.
-// Считаем vmax «пиковым холдом» на окне 50 мс (запоминаем максимум).
-// Сравниваем пики двух соседних окон — это устойчиво к ШИМ-паузам.
-// Моментальное ON на реальном фронте, 1 с задержки OFF, таймаут 120 с.
+// Вход — ШИМ. Peak-hold был слеп к скважности: пока ШИМ импульсирует,
+// пик не меняется, и плавные изменения газа не видны.
+// Решение: считаем СРЕДНЕЕ vmax за окно — оно линейно пропорционально
+// скважности ШИМ, то есть средней мощности на моторе.
+// Моментальное ON на спаде среднего, 1 с задержки OFF, таймаут 120 с.
 class StopLightController {
   private:
     OutputController* _output;
-    float _rateThreshold;             // порог по скорости спада пика (В/с)
-    unsigned long _offDelayMs;        // задержка перед выключением после торможения
+    float _rateThreshold;             // порог по скорости спада среднего (В/с)
+    unsigned long _offDelayMs;        // задержка перед выключением
     unsigned long _timeoutMs;         // максимальное удержание
-    float _moveThreshold;             // порог «машина движется»
-    unsigned long _sampleIntervalMs;  // длина окна пикового холда
+    float _moveThreshold;             // порог «машина движется» (по мгновенному vmax)
+    unsigned long _sampleIntervalMs;  // окно усреднения
 
-    float _peakHold;                  // пик vmax в ТЕКУЩЕМ окне
-    float _lastPeak;                  // пик vmax в ПРЕДЫДУЩЕМ окне
+    float _sumVmax;                   // накопление vmax в текущем окне
+    unsigned long _countVmax;         // количество сэмплов в текущем окне
+    float _lastAvg;                   // среднее предыдущего окна
+    float _currentAvg;                // среднее текущего окна (последнее посчитанное)
     unsigned long _lastSampleTime;    // момент начала текущего окна
     unsigned long _lastBrakeTime;     // момент последнего подтверждённого торможения
     bool _on;
@@ -405,13 +410,16 @@ class StopLightController {
       : _output(output), _rateThreshold(rateThreshold),
         _offDelayMs(offDelayMs), _timeoutMs(timeoutMs),
         _moveThreshold(moveThreshold), _sampleIntervalMs(sampleIntervalMs),
-        _peakHold(0), _lastPeak(0), _lastSampleTime(0),
+        _sumVmax(0), _countVmax(0),
+        _lastAvg(0), _currentAvg(0), _lastSampleTime(0),
         _lastBrakeTime(0), _on(false) {}
 
     void begin() {
       _output->off();
-      _peakHold = 0;
-      _lastPeak = 0;
+      _sumVmax = 0;
+      _countVmax = 0;
+      _lastAvg = 0;
+      _currentAvg = 0;
       _lastSampleTime = millis();
       _lastBrakeTime = 0;
       _on = false;
@@ -421,20 +429,20 @@ class StopLightController {
       unsigned long now = millis();
       float vmax = max(fabs(voltageA), fabs(voltageB));
 
-      // 1. Пиковый холд: запоминаем максимум за текущее окно.
-      //    ШИМ-паузы (0 В в середине окна) не портят пик.
-      if (vmax > _peakHold) _peakHold = vmax;
+      // === 1. Накопление для среднего ===
+      _sumVmax += vmax;
+      _countVmax++;
 
-      // 2. В конце окна сравниваем пики двух соседних окон.
+      // === 2. Конец окна: считаем среднее и его rate ===
       if (now - _lastSampleTime >= _sampleIntervalMs) {
+        float avg = _sumVmax / (float)_countVmax;
+        _currentAvg = avg;
+
         unsigned long dt = now - _lastSampleTime;
-        float rate = (_peakHold - _lastPeak) * 1000.0 / dt;
+        float rate = (avg - _lastAvg) * 1000.0 / dt;
 
-        _lastPeak = _peakHold;   // текущий пик становится предыдущим
-        _peakHold = 0;            // новое окно начинается с нуля
-        _lastSampleTime = now;
-
-        // Реальное торможение: пик упал быстрее порога
+        // Реальное торможение: среднее упало ниже порога.
+        // Даже плавный сброс газа даёт rate порядка −1…−4 В/с, что выше порога 1.0.
         if (rate < -_rateThreshold) {
           _lastBrakeTime = now;
           if (!_on) {
@@ -442,16 +450,21 @@ class StopLightController {
             _output->on();
           }
         }
+
+        // Сброс окна
+        _lastAvg = avg;
+        _sumVmax = 0;
+        _countVmax = 0;
+        _lastSampleTime = now;
       }
 
-      // 3. OFF-условие — проверяем каждый цикл.
-      //    Для «машина движется» берём максимум из текущего и предыдущего пиков:
-      //    так мы не попадём в короткий момент после сброса _peakHold.
+      // === 3. OFF-условие — проверяем каждый цикл ===
+      // «Движется» — по мгновенному vmax: плотный опрос ловит даже короткие
+      // импульсы ШИМ, поэтому ложных «стою» при движении не будет.
       if (_on) {
-        float currentLevel = max(_peakHold, _lastPeak);
         bool offDelayPassed = (now - _lastBrakeTime > _offDelayMs);
         bool timeoutPassed  = (now - _lastBrakeTime > _timeoutMs);
-        bool moving         = (currentLevel > _moveThreshold);
+        bool moving         = (vmax > _moveThreshold);
 
         if (offDelayPassed && (moving || timeoutPassed)) {
           _on = false;
@@ -461,9 +474,9 @@ class StopLightController {
     }
 
     bool isOn() const { return _on; }
-    // ЗАДАЧА А: диагностика peak-hold
-    float getPeakHold() const { return _peakHold; }
-    float getLastPeak() const { return _lastPeak; }
+    // ЗАДАЧА А: диагностика
+    float getCurrentAvg() const { return _currentAvg; }
+    float getLastAvg() const { return _lastAvg; }
 };
 
 // 4. Главный контроллер
@@ -559,8 +572,8 @@ class MainController {
         Serial.print(F(" drop="));   Serial.print(_poleBDetector.getDropDuration());
         Serial.print(F(" act="));    Serial.print(_poleBDetector.isLoadActive() ? 1 : 0);
 
-        Serial.print(F(" || SL pkH=")); Serial.print(_stopLight.getPeakHold(), 2);
-        Serial.print(F(" pkL="));       Serial.print(_stopLight.getLastPeak(), 2);
+        Serial.print(F(" || SL avg=")); Serial.print(_stopLight.getCurrentAvg(), 2);
+        Serial.print(F(" prev="));      Serial.print(_stopLight.getLastAvg(), 2);
         Serial.print(F(" STOP="));      Serial.println(_stopLight.isOn() ? 1 : 0);
 
         // Сбрасываем пики для следующего окна логирования
