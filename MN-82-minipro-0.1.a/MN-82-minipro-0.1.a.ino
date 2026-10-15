@@ -56,10 +56,12 @@ const unsigned long LOG_INTERVAL_MS = 500;
 // === ЗАДАЧА А: параметры контроллера стоп-сигналов ===
 const float STOP_RATE_THRESHOLD = 8.0;         // порог срабатывания по скорости спада (В/с)
                                                 // в 5 раз выше шума АЦП (1.53 В/с) и в 5 раз ниже реального торможения (40+)
-const unsigned long STOP_OFF_DELAY_MS = 1000;   // задержка перед выключением после прекращения торможения
+const unsigned long STOP_OFF_DELAY_MS = 250;   // задержка перед выключением после прекращения торможения
 const unsigned long STOP_TIMEOUT_MS = 120000;   // максимум удержания стоп-сигнала (120 с)
-const float STOP_MOVE_THRESHOLD = 1.0;          // порог «машина движется» (В)
-const unsigned long STOP_SAMPLE_INTERVAL_MS = 50;  // интервал расчёта rate (мс)
+const float STOP_MOVE_THRESHOLD = 0.5;          // порог «машина движется» (В)
+const unsigned long STOP_SAMPLE_INTERVAL_MS = 250; // окно peak-hold (мс)
+                                                   // должно быть больше периода ШИМ,
+                                                   // чтобы окно захватывало хотя бы один полный цикл
 
 // ==================== КЛАССЫ ====================
 
@@ -459,6 +461,9 @@ class StopLightController {
     }
 
     bool isOn() const { return _on; }
+    // ЗАДАЧА А: диагностика peak-hold
+    float getPeakHold() const { return _peakHold; }
+    float getLastPeak() const { return _lastPeak; }
 };
 
 // 4. Главный контроллер
@@ -554,7 +559,9 @@ class MainController {
         Serial.print(F(" drop="));   Serial.print(_poleBDetector.getDropDuration());
         Serial.print(F(" act="));    Serial.print(_poleBDetector.isLoadActive() ? 1 : 0);
 
-        Serial.print(F(" || STOP=")); Serial.println(_stopLight.isOn() ? 1 : 0);
+        Serial.print(F(" || SL pkH=")); Serial.print(_stopLight.getPeakHold(), 2);
+        Serial.print(F(" pkL="));       Serial.print(_stopLight.getLastPeak(), 2);
+        Serial.print(F(" STOP="));      Serial.println(_stopLight.isOn() ? 1 : 0);
 
         // Сбрасываем пики для следующего окна логирования
         _poleADetector.resetPeaks();
