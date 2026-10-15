@@ -377,21 +377,22 @@ class ReverseLightController {
 };
 
 // === ЗАДАЧА А: Контроллер стоп-сигналов ===
-// Ключевая идея: rate вычисляем только раз в STOP_SAMPLE_INTERVAL_MS.
-// Мгновенный rate на интервале 1 мс измеряет шум АЦП, а не скорость мотора.
-// На интервале 50 мс шум АЦП даёт ~0.3 В/с (в 27 раз ниже порога),
-// а реальное торможение — 80+ В/с (в 10 раз выше порога).
+// Ключевая идея: вход — ШИМ, а не постоянное напряжение.
+// Считаем vmax «пиковым холдом» на окне 50 мс (запоминаем максимум).
+// Сравниваем пики двух соседних окон — это устойчиво к ШИМ-паузам.
+// Моментальное ON на реальном фронте, 1 с задержки OFF, таймаут 120 с.
 class StopLightController {
   private:
     OutputController* _output;
-    float _rateThreshold;             // порог по скорости спада (В/с)
+    float _rateThreshold;             // порог по скорости спада пика (В/с)
     unsigned long _offDelayMs;        // задержка перед выключением после торможения
     unsigned long _timeoutMs;         // максимальное удержание
     float _moveThreshold;             // порог «машина движется»
-    unsigned long _sampleIntervalMs;  // интервал замера rate (мс)
+    unsigned long _sampleIntervalMs;  // длина окна пикового холда
 
-    float _lastVmax;                  // предыдущее значение max(|A|, |B|) НА МОМЕНТ ЗАМЕРА
-    unsigned long _lastSampleTime;    // момент последнего замера rate
+    float _peakHold;                  // пик vmax в ТЕКУЩЕМ окне
+    float _lastPeak;                  // пик vmax в ПРЕДЫДУЩЕМ окне
+    unsigned long _lastSampleTime;    // момент начала текущего окна
     unsigned long _lastBrakeTime;     // момент последнего подтверждённого торможения
     bool _on;
 
@@ -402,12 +403,13 @@ class StopLightController {
       : _output(output), _rateThreshold(rateThreshold),
         _offDelayMs(offDelayMs), _timeoutMs(timeoutMs),
         _moveThreshold(moveThreshold), _sampleIntervalMs(sampleIntervalMs),
-        _lastVmax(0), _lastSampleTime(0),
+        _peakHold(0), _lastPeak(0), _lastSampleTime(0),
         _lastBrakeTime(0), _on(false) {}
 
     void begin() {
       _output->off();
-      _lastVmax = 0;
+      _peakHold = 0;
+      _lastPeak = 0;
       _lastSampleTime = millis();
       _lastBrakeTime = 0;
       _on = false;
@@ -417,14 +419,20 @@ class StopLightController {
       unsigned long now = millis();
       float vmax = max(fabs(voltageA), fabs(voltageB));
 
-      // === 1. Замер rate — только раз в _sampleIntervalMs ===
+      // 1. Пиковый холд: запоминаем максимум за текущее окно.
+      //    ШИМ-паузы (0 В в середине окна) не портят пик.
+      if (vmax > _peakHold) _peakHold = vmax;
+
+      // 2. В конце окна сравниваем пики двух соседних окон.
       if (now - _lastSampleTime >= _sampleIntervalMs) {
         unsigned long dt = now - _lastSampleTime;
-        float rate = (vmax - _lastVmax) * 1000.0 / dt;
-        _lastVmax = vmax;
+        float rate = (_peakHold - _lastPeak) * 1000.0 / dt;
+
+        _lastPeak = _peakHold;   // текущий пик становится предыдущим
+        _peakHold = 0;            // новое окно начинается с нуля
         _lastSampleTime = now;
 
-        // ON при спаде ниже порога
+        // Реальное торможение: пик упал быстрее порога
         if (rate < -_rateThreshold) {
           _lastBrakeTime = now;
           if (!_on) {
@@ -434,13 +442,15 @@ class StopLightController {
         }
       }
 
-      // === 2. OFF-условие — проверяем КАЖДЫЙ цикл, по свежему vmax ===
+      // 3. OFF-условие — проверяем каждый цикл.
+      //    Для «машина движется» берём максимум из текущего и предыдущего пиков:
+      //    так мы не попадём в короткий момент после сброса _peakHold.
       if (_on) {
+        float currentLevel = max(_peakHold, _lastPeak);
         bool offDelayPassed = (now - _lastBrakeTime > _offDelayMs);
         bool timeoutPassed  = (now - _lastBrakeTime > _timeoutMs);
-        bool moving         = (vmax > _moveThreshold);
+        bool moving         = (currentLevel > _moveThreshold);
 
-        // Гасим, если: прошло >= 1 с после торможения И (машина снова едет ИЛИ 120 с прошло)
         if (offDelayPassed && (moving || timeoutPassed)) {
           _on = false;
           _output->off();
