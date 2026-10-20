@@ -7,42 +7,29 @@
 
 // ==================== НАСТРОЙКИ ====================
 // --- Пины ---
-const uint8_t PIN_ANALOG_POLE_A = A1;   // полюс A мотора
-const uint8_t PIN_ANALOG_POLE_B = A2;   // полюс B мотора
-
+// входы от RC
 const uint8_t PIN_RC_VT = 12;
 const uint8_t PIN_RC_D0 = 10;//8
 const uint8_t PIN_RC_D1 = 11;//9
 const uint8_t PIN_RC_D2 = 9;//11
 const uint8_t PIN_RC_D3 = 8;//10
 
+// выходы на нагрузку
 const uint8_t PIN_OUT_BRAKE = 7;    // тормоз
 const uint8_t PIN_OUT_AUX   = 5;    // задний Ход
 const uint8_t PIN_OUT_FL = 4;
 const uint8_t PIN_OUT_TL = 3;
 const uint8_t PIN_OUT_TR = 2;
 
-// --- Аналоговый делитель ---
-const float DIVIDER_RATIO = 0.3197;   // R2/(R1+R2)
-const float VREF = 5.0;
+// === Тахометр на двух датчиках Холла ===
+const uint8_t PIN_HALL_A = A1; // Датчик A 
+const uint8_t PIN_HALL_B = A2; // Датчик B 
 
-// --- Параметры детектора быстрого спада ---
-const float MIN_DROP_RATE = 0.50;               // минимальная скорость падения, В/с
-const unsigned long MIN_DROP_DURATION_MS = 50; // мин. длительность быстрого падения
-const unsigned long MAX_LOAD_TIME_MS = 10000;   // макс. время удержания тормоза
-const float CUTOFF_VOLTAGE = 0.5;               // порог отсечки (В)
-const unsigned long CUTOFF_HOLD_MS = 10000;     // задержка после падения ниже порога
-const unsigned long UPDATE_INTERVAL_MS = 10;    // период обновления детектора
-
-// --- Порог для определения направления вращения ---
-const float DIRECTION_THRESHOLD = 0.1;          // минимальная разность напряжений (В)
-const unsigned long LAMP_HOLD_MS = 60000;       // ЗАДАЧА Б: удержание огней ЗХ после пропадания реверса (60 с)
-const unsigned long LAMP_HYSTERESIS_MS = 500;   // ЗАДАЧА Б: игнорировать пропадания реверса короче этого времени
-
-// --- Параметры RC-каналов (ШИМ) ---
-//const unsigned long MIN_PULSE = 1000;
-//const unsigned long MAX_PULSE = 2000;
-//const bool USE_PWM = false;
+const unsigned long TACHO_STOP_THRESHOLD_MS = 300;   // нет импульсов дольше → стоим
+const unsigned long BRAKE_OFF_DELAY_MS = 0;        // задержка OFF стоп-сигналов 
+const unsigned long STOP_HOLD_MS = 120000;           // удержание стоп-сигнала после остановки (120 с)
+const unsigned long REVERSE_HOLD_MS = 60000;         // удержание ЗХ после остановки (60 с)
+const float BRAKE_DECEL_RATIO = 1.1;                 // замедление: интервал вырос в 1.5 раза → торможение
 
 // Уровни для PNP-транзистора (BC327-40)
 #define OUTPUT_ACTIVE   LOW
@@ -52,138 +39,14 @@ const unsigned long LAMP_HYSTERESIS_MS = 500;   // ЗАДАЧА Б: игнори
 const unsigned long BLINK1_ON_MS  = 350;  // время включения (мс)
 const unsigned long BLINK1_OFF_MS = 350;  // время выключения (мс)
 
-// === ЗАДАЧА А: интервал вывода логов в монитор порта ===
+// === интервал вывода логов в монитор порта ===
 const unsigned long LOG_INTERVAL_MS = 500;
 
-// === ЗАДАЧА А: параметры контроллера стоп-сигналов (трендовые) ===
-const unsigned long STOP_OFF_DELAY_MS = 100;    // антидребезг: держим STOP ещё 1 с после последнего торможения
-const unsigned long STOP_TIMEOUT_MS = 120000;    // максимум удержания (120 с) без активности
-const unsigned long STOP_SUBWINDOW_MS = 500;     // длина подокна (мс). ДОЛЖНА быть > периода ШИМ,
-                                                 // иначе среднее прыгает по фазам
-const float STOP_FAST_THRESHOLD = 2.0;           // порог быстрого тренда (В/с) — резкое торможение
-const float STOP_SLOW_THRESHOLD = 0.15;          // порог медленного тренда (В/с) — плавное снижение
-const float STOP_MOVE_THRESHOLD = 1.0;           // порог «машина активно едет» по пику за 4 с (В)
 
 // ==================== КЛАССЫ ====================
 
-// 1. Класс детектора быстрого спада напряжения
-class VoltageDropDetector {
-  private:
-    uint8_t _pin;
-    float   _dividerRatio;
-    float   _vref;
-    float   _minDropRate;
-    unsigned long _minDropDuration;
-    unsigned long _maxLoadTime;
-    float   _cutoffVoltage;
-    unsigned long _cutoffHoldTime;
-    unsigned long _updateInterval;
-
-    float _lastVoltage;
-    unsigned long _lastTime;
-    unsigned long _lastUpdate;
-    unsigned long _dropDuration;
-    bool _loadActive;
-    unsigned long _loadStartTime;
-    bool _cutoffEntered;
-    unsigned long _cutoffEnterTime;
-    // === ЗАДАЧА А: переменные для диагностики ===
-    float _lastRate;   // последняя вычисленная скорость изменения (В/с)
-    float _peakMin;    // минимум напряжения с момента последнего resetPeaks()
-    float _peakMax;    // максимум напряжения с момента последнего resetPeaks()
-
-  public:
-    VoltageDropDetector(uint8_t pin, float dividerRatio, float vref,
-                        float minDropRate, unsigned long minDropDuration,
-                        unsigned long maxLoadTime, float cutoffVoltage,
-                        unsigned long cutoffHoldTime, unsigned long updateInterval)
-      : _pin(pin), _dividerRatio(dividerRatio), _vref(vref),
-        _minDropRate(minDropRate), _minDropDuration(minDropDuration),
-        _maxLoadTime(maxLoadTime), _cutoffVoltage(cutoffVoltage),
-        _cutoffHoldTime(cutoffHoldTime), _updateInterval(updateInterval),
-        _lastVoltage(0), _lastTime(0), _lastUpdate(0),
-        _dropDuration(0), _loadActive(false), _loadStartTime(0),
-        _cutoffEntered(false), _cutoffEnterTime(0),
-        _lastRate(0), _peakMin(999.0), _peakMax(0.0) {}
-
-    void begin() {
-      pinMode(_pin, INPUT);
-      _lastVoltage = readVoltage();
-      _lastTime = millis();
-      _lastUpdate = _lastTime;
-    }
-
-    float readVoltage() {
-      int raw = analogRead(_pin);
-      float voltageAtPin = (raw * _vref) / 1023.0;
-      return voltageAtPin / _dividerRatio;
-    }
-
-    void update() {
-		unsigned long now = millis();
-		if (now - _lastUpdate < _updateInterval) return;
-		_lastUpdate = now;
-		
-		float voltage = readVoltage();
-		float dt = (now - _lastTime) / 1000.0;
-		float dv = voltage - _lastVoltage;
-		float rate = dv / dt;
-		_lastRate = rate;                            // ЗАДАЧА А: сохраняем для логирования
-		if (voltage < _peakMin) _peakMin = voltage;  // ЗАДАЧА А: трекинг минимума
-		if (voltage > _peakMax) _peakMax = voltage;  // ЗАДАЧА А: трекинг максимума
-		
-		// Проверка быстрого спада
-		if (rate < -_minDropRate) {
-		_dropDuration += (now - _lastTime);
-		} else {
-		_dropDuration = 0;
-		}
-		
-		// Включение нагрузки при выполнении условий
-		if (!_loadActive && _dropDuration >= _minDropDuration && voltage > _cutoffVoltage) {
-		_loadActive = true;
-		_cutoffEntered = false;
-		}
-		
-        // Обработка выключения
-        if (_loadActive) {
-          // Условие 1: напряжение перестало падать (rate >= 0)
-          if (rate >= 0) {
-            _loadActive = false;
-          }
-          // Условие 2: напряжение ниже порога и прошло время удержания
-          else if (voltage < _cutoffVoltage) {
-            if (!_cutoffEntered) {
-              _cutoffEntered = true;
-              _cutoffEnterTime = now;
-            } else if (now - _cutoffEnterTime >= _cutoffHoldTime) {
-              _loadActive = false;
-            }
-          }
-        
-          // Сброс таймера отсечки, если напряжение снова поднялось выше порога
-          if (voltage >= _cutoffVoltage && _cutoffEntered) {
-            _cutoffEntered = false;
-          }
-        }
-
-		_lastVoltage = voltage;
-		_lastTime = now;
-	}
-
-    bool isLoadActive() const { return _loadActive; }
-    float getLastVoltage() const { return _lastVoltage; }
-    // === ЗАДАЧА А: геттеры для диагностики ===
-    float getLastRate() const { return _lastRate; }
-    float getPeakMin() const { return _peakMin; }
-    float getPeakMax() const { return _peakMax; }
-    unsigned long getDropDuration() const { return _dropDuration; }
-    void resetPeaks() { _peakMin = 999.0; _peakMax = 0.0; }  // вызывать после логирования
-};
-
-
-// 2. Класс для чтения цифрового канала приёмника (RC)
-//    Теперь только digitalRead, возвращает bool.
+// ============================================================================
+// Класс для чтения цифрового канала приёмника (RC)
 class RCChannel {
   private:
     uint8_t _pin;
@@ -194,7 +57,107 @@ class RCChannel {
     bool read() {return digitalRead(_pin); }
 };
 
-// 3. Класс управления выходом
+// ============================================================================
+// Тахометр на двух датчиках Холла
+// Определяет направление по разнице интервалов A->B и B->A.
+// Определяет торможение по резкому росту интервала между любыми импульсами.
+class Tachometer {
+  private:
+    uint8_t _pinA, _pinB;
+    bool _lastStateA, _lastStateB;
+    unsigned long _timeA, _timeB;
+    unsigned long _lastPulseTime;
+    unsigned long _intervalAB, _intervalBA;
+    unsigned long _lastInterval;
+    int8_t _direction;   // 1 = Вперёд, -1 = Назад, 0 = Стоим
+    bool _braking;
+
+  public:
+    Tachometer(uint8_t pinA, uint8_t pinB)
+      : _pinA(pinA), _pinB(pinB),
+        _lastStateA(true), _lastStateB(true),
+        _timeA(0), _timeB(0), _lastPulseTime(0),
+        _intervalAB(0), _intervalBA(0), _lastInterval(0),
+        _direction(0), _braking(false) {}
+
+    void begin() {
+      // A3144 имеет открытый коллектор — нужен подтягивающий резистор.
+      // Внутренний INPUT_PULLUP подойдёт, если провода не длинные.
+      pinMode(_pinA, INPUT_PULLUP);
+      pinMode(_pinB, INPUT_PULLUP);
+      _lastStateA = digitalRead(_pinA);
+      _lastStateB = digitalRead(_pinB);
+      _lastPulseTime = millis();
+    }
+
+    void update() {
+      bool a = digitalRead(_pinA);
+      bool b = digitalRead(_pinB);
+      unsigned long now = millis();
+
+      // Датчик A3144 тянет линию вниз при обнаружении магнита (активный LOW).
+      // Ловим фронт HIGH -> LOW.
+      bool edgeA = (a == LOW && _lastStateA == HIGH);
+      bool edgeB = (b == LOW && _lastStateB == HIGH);
+
+      if (edgeA) {
+        if (_timeB > 0) {
+          _intervalBA = now - _timeB;
+          if (_intervalBA > 5 && _intervalBA < 1000) {
+            // Если B->A короче, чем A->B, значит едем назад (датчики ближе друг к другу)
+            if (_intervalBA < _intervalAB) _direction = -1;
+            else _direction = 1;
+          }
+        }
+        _timeA = now;
+      }
+
+      if (edgeB) {
+        if (_timeA > 0) {
+          _intervalAB = now - _timeA;
+          if (_intervalAB > 5 && _intervalAB < 1000) {
+            // Если A->B короче, значит едем вперёд
+            if (_intervalAB < _intervalBA) _direction = 1;
+            else _direction = -1;
+          }
+        }
+        _timeB = now;
+      }
+
+      // Обработка торможения и остановки
+      if (edgeA || edgeB) {
+        unsigned long currentInterval = now - _lastPulseTime;
+        if (_lastInterval > 0 && currentInterval < 1000) {
+          // Если интервал резко вырос — значит мотор тормозит
+          _braking = (currentInterval > _lastInterval * BRAKE_DECEL_RATIO);
+        } else {
+          _braking = false;
+        }
+        _lastInterval = currentInterval;
+        _lastPulseTime = now;
+      }
+
+      _lastStateA = a;
+      _lastStateB = b;
+
+      // Если импульсов нет дольше порога — стоим
+      if (now - _lastPulseTime > TACHO_STOP_THRESHOLD_MS) {
+        _direction = 0;
+        _braking = false;
+        _lastInterval = 0;
+        _intervalAB = 0;
+        _intervalBA = 0;
+      }
+    }
+
+    int8_t getDirection() const { return _direction; }
+    bool isStopped() const { return _direction == 0; }
+    bool isBraking() const { return _braking; }
+    unsigned long getLastPulseAge() const { return millis() - _lastPulseTime; }
+};
+
+// ============================================================================
+// Класс управления выходом
 class OutputController {
   private:
     uint8_t _pin;
@@ -214,7 +177,8 @@ class OutputController {
     void set(bool state) { state ? on() : off(); }
 };
 
-// === ЗАДАЧА В: Синхронный контроллер двух поворотников ===
+// ============================================================================
+// Синхронный контроллер двух поворотников
 // Один общий таймер — противофаза физически невозможна.
 // Каждый поворотник включается независимо (рычагом) + есть общий режим "аварийка".
 class DualBlinker {
@@ -296,218 +260,46 @@ class DualBlinker {
     }
 };
 
-// === ЗАДАЧА Б: Контроллер огней заднего хода ===
-// Логика:
-//   - diff > +threshold  (мотор крутится назад)   -> огни ВКЛ, сбрасываем таймер
-//   - diff < -threshold  (мотор крутится вперёд)  -> огни ВЫКЛ немедленно
-//   - промежуточное состояние (стоп или ШИМ-пауза):
-//       * если прошло < _hysteresisMs с последнего реверса — продолжаем гореть
-//         (защита от дребезга ШИМ на низкой скорости)
-//       * иначе запускается 60-секундный таймер удержания
-//       * по истечении _holdMs огни гаснут
+// ============================================================================
+// Контроллер огней заднего хода (на тахометре)
+// Включает ЗХ, если тахометр зафиксировал вращение назад.
+// Гасит сразу при переключении вперёд или через 60 с после остановки.
 class ReverseLightController {
   private:
-    OutputController* _output;      // управляемый выход
-    float _threshold;               // порог разности напряжений (В)
-    unsigned long _holdMs;          // удержание после остановки (мс)
-    unsigned long _hysteresisMs;    // игнорирование коротких провалов ШИМ (мс)
-
-    enum State { OFF, REVERSE, HOLD };
-    State _state;
-    unsigned long _lastReverseSeen; // последний момент, когда diff > threshold
-
-  public:
-    ReverseLightController(OutputController* output, float threshold,
-                           unsigned long holdMs, unsigned long hysteresisMs)
-      : _output(output), _threshold(threshold),
-        _holdMs(holdMs), _hysteresisMs(hysteresisMs),
-        _state(OFF), _lastReverseSeen(0) {}
-
-    void begin() {
-      _output->off();
-      _state = OFF;
-      _lastReverseSeen = 0;
-    }
-
-    void update(float diff) {
-      unsigned long now = millis();
-
-      bool clearReverse = (diff >  _threshold);  // явный реверс
-      bool clearForward = (diff < -_threshold);  // явный ход вперёд
-
-      if (clearReverse) {
-        _lastReverseSeen = now;  // каждое подтверждение реверса обновляет таймер
-      }
-
-      switch (_state) {
-        case OFF:
-          if (clearReverse) {
-            _state = REVERSE;
-            _output->on();
-          }
-          break;
-
-        case REVERSE:
-          if (clearForward) {
-            // Резкая смена направления — гасим немедленно
-            _state = OFF;
-            _output->off();
-          } else if (!clearReverse && (now - _lastReverseSeen > _hysteresisMs)) {
-            // Сигнал реверса пропал и не вернулся за время гистерезиса
-            // Переходим в режим удержания — огни продолжают гореть
-            _state = HOLD;
-          }
-          // иначе — всё ещё в реверсе, оставляем гореть
-          break;
-
-        case HOLD:
-          if (clearReverse) {
-            // Мотор снова крутится назад
-            _state = REVERSE;
-          } else if (clearForward) {
-            // Мотор крутится вперёд — гасим
-            _state = OFF;
-            _output->off();
-          } else if (now - _lastReverseSeen > _hysteresisMs + _holdMs) {
-            // 60 с истекли — гасим
-            _state = OFF;
-            _output->off();
-          }
-          // иначе — огни продолжают гореть в фоне
-          break;
-      }
-    }
-};
-
-// === ЗАДАЧА А: Контроллер стоп-сигналов (трендовый) ===
-// Идея: храним кольцевой буфер средних значений подокон.
-//   - Быстрый тренд: сравнение текущего подокна с предыдущим (ловкое торможение).
-//   - Медленный тренд: сравнение среднего 1-й и 2-й половин буфера (плавное снижение).
-// Любой из трендов ниже порога → STOP ON. Оба выше порога 1 сек → STOP OFF.
-class StopLightController {
-  private:
     OutputController* _output;
-    unsigned long _offDelayMs;
-    unsigned long _timeoutMs;
-    unsigned long _subWindowMs;
-    float _fastThreshold;    // В/с
-    float _slowThreshold;    // В/с
-    float _moveThreshold;    // В
-
-    static const uint8_t BUF_SIZE = 8;  // 8 подокон по 500 мс = 4 сек истории
-    float _buf[BUF_SIZE];
-    uint8_t _bufHead;        // куда писать следующее
-    uint8_t _bufLen;         // сколько заполнено (до BUF_SIZE)
-
-    float _subSum;           // сумма vmax внутри подокна
-    unsigned long _subCount; // количество сэмплов в подокне
-    unsigned long _subStart; // время начала подокна
-
-    float _lastSubMean;      // среднее последнего подокна
-    float _bufMax;           // максимум по буферу (для «машина едет»)
-    float _fastRate;         // диагностика
-    float _slowRate;         // диагностика
-
+    Tachometer* _tacho;
+    unsigned long _holdMs;
+    unsigned long _lastReverseTime;
     bool _on;
-    unsigned long _lastBrakeTime;
 
   public:
-    StopLightController(OutputController* output,
-                        unsigned long offDelayMs,
-                        unsigned long timeoutMs,
-                        unsigned long subWindowMs,
-                        float fastThreshold,
-                        float slowThreshold,
-                        float moveThreshold)
-      : _output(output),
-        _offDelayMs(offDelayMs), _timeoutMs(timeoutMs),
-        _subWindowMs(subWindowMs),
-        _fastThreshold(fastThreshold), _slowThreshold(slowThreshold),
-        _moveThreshold(moveThreshold),
-        _bufHead(0), _bufLen(0),
-        _subSum(0), _subCount(0), _subStart(0),
-        _lastSubMean(0), _bufMax(0),
-        _fastRate(0), _slowRate(0),
-        _on(false), _lastBrakeTime(0) {}
+    ReverseLightController(OutputController* output, Tachometer* tacho, unsigned long holdMs)
+      : _output(output), _tacho(tacho), _holdMs(holdMs),
+        _lastReverseTime(0), _on(false) {}
 
     void begin() {
       _output->off();
-      _bufHead = 0; _bufLen = 0;
-      _subSum = 0; _subCount = 0; _subStart = millis();
-      _lastSubMean = 0; _bufMax = 0;
-      _fastRate = 0; _slowRate = 0;
-      _on = false; _lastBrakeTime = 0;
+      _lastReverseTime = 0;
+      _on = false;
     }
 
-    void update(float va, float vb) {
+    void update() {
       unsigned long now = millis();
-      float vmax = max(fabs(va), fabs(vb));
-      _subSum += vmax;
-      _subCount++;
+      int8_t dir = _tacho->getDirection();
 
-      // === Конец подокна: считаем среднее, обновляем буфер, тренды ===
-      if (now - _subStart >= _subWindowMs) {
-        float subMean = _subSum / (float)_subCount;
-
-        // Быстрый тренд: сравнение с предыдущим подокном
-        float fastRate = (_bufLen > 0)
-                         ? (subMean - _lastSubMean) * 1000.0 / _subWindowMs
-                         : 0.0;
-        _lastSubMean = subMean;
-
-        // Кладём в кольцевой буфер
-        _buf[_bufHead] = subMean;
-        _bufHead = (_bufHead + 1) % BUF_SIZE;
-        if (_bufLen < BUF_SIZE) _bufLen++;
-
-        // Медленный тренд: сравнение среднего первой половины и второй
-        float slowRate = 0.0;
-        if (_bufLen >= 4) {
-          uint8_t half = _bufLen / 2;
-          uint8_t oldest = (_bufHead + BUF_SIZE - _bufLen) % BUF_SIZE;
-          float sumFirst = 0, sumSecond = 0;
-          for (uint8_t i = 0; i < half; i++) {
-            sumFirst += _buf[(oldest + i) % BUF_SIZE];
-          }
-          for (uint8_t i = half; i < _bufLen; i++) {
-            sumSecond += _buf[(oldest + i) % BUF_SIZE];
-          }
-          float meanFirst  = sumFirst  / half;
-          float meanSecond = sumSecond / (_bufLen - half);
-          float dt = (half * _subWindowMs) / 1000.0;
-          slowRate = (meanSecond - meanFirst) / dt;
+      if (dir == -1) { // Едем назад
+        _lastReverseTime = now;
+        if (!_on) {
+          _on = true;
+          _output->on();
         }
-
-        // Максимум по буферу — для оценки «машина едет»
-        float bmax = 0;
-        for (uint8_t i = 0; i < _bufLen; i++) {
-          if (_buf[i] > bmax) bmax = _buf[i];
+      } else if (dir == 1) { // Едем вперёд
+        if (_on) {
+          _on = false;
+          _output->off();
         }
-        _bufMax = bmax;
-
-        _fastRate = fastRate;
-        _slowRate = slowRate;
-
-        // Тормозим, если ЛЮБОЙ тренд ниже порога
-        if (fastRate < -_fastThreshold || slowRate < -_slowThreshold) {
-          _lastBrakeTime = now;
-          if (!_on) {
-            _on = true;
-            _output->on();
-          }
-        }
-
-        _subSum = 0;
-        _subCount = 0;
-        _subStart = now;
-      }
-
-      // === OFF: 1 с без торможения И (машина активно едет ИЛИ прошло 120 с) ===
-      if (_on) {
-        bool offDelayPassed = (now - _lastBrakeTime > _offDelayMs);
-        bool timeoutPassed  = (now - _lastBrakeTime > _timeoutMs);
-        bool moving         = (_bufMax > _moveThreshold);
-        if (offDelayPassed && (moving || timeoutPassed)) {
+      } else { // Стоим
+        if (_on && (now - _lastReverseTime > _holdMs)) {
           _on = false;
           _output->off();
         }
@@ -515,40 +307,98 @@ class StopLightController {
     }
 
     bool isOn() const { return _on; }
-    // Диагностика
-    float getFastRate() const { return _fastRate; }
-    float getSlowRate() const { return _slowRate; }
-    float getLastSubMean() const { return _lastSubMean; }
-    float getBufMax() const { return _bufMax; }
 };
 
-// 4. Главный контроллер
+// ============================================================================
+// Контроллер стоп-сигналов (на тахометре) ===
+// Включает стоп при торможении или остановке.
+// Держит включённым STOP_HOLD_MS после остановки (120 с).
+// Выключает: при возобновлении движения (через offDelay) ИЛИ по истечении STOP_HOLD_MS.
+class StopLightController {
+  private:
+    OutputController* _output;
+    Tachometer* _tacho;
+    unsigned long _offDelayMs;   // задержка OFF при возобновлении движения
+    unsigned long _holdMs;        // максимальное удержание после остановки (120 с)
+
+    unsigned long _stopStartTime; // момент, когда машина остановилась (один раз)
+    bool _wasStopped;             // для отслеживания перехода moving->stopped
+    bool _on;
+
+  public:
+    StopLightController(OutputController* output, Tachometer* tacho,
+                        unsigned long offDelayMs, unsigned long holdMs)
+      : _output(output), _tacho(tacho),
+        _offDelayMs(offDelayMs), _holdMs(holdMs),
+        _stopStartTime(0), _wasStopped(false), _on(false) {}
+
+    void begin() {
+      _output->off();
+      _stopStartTime = 0;
+      _wasStopped = false;
+      _on = false;
+    }
+    void update() {
+      unsigned long now = millis();
+      bool stopped = _tacho->isStopped();
+      bool braking = _tacho->isBraking();
+
+      // === 1. Торможение — активное событие ===
+      if (braking) {
+        if (!_on) { _on = true; _output->on(); }
+        // Начало остановки запомним в момент перехода в stopped
+        _wasStopped = false;
+        return;
+      }
+
+      // === 2. Стоим ===
+      if (stopped) {
+        // Переход moving->stopped: фиксируем момент остановки ОДИН РАЗ
+        if (!_wasStopped) {
+          _stopStartTime = now;
+          _wasStopped = true;
+        }
+        if (!_on) { _on = true; _output->on(); }
+
+        // Таймаут 120 с
+        if (_on && (now - _stopStartTime > _holdMs)) {
+          _on = false;
+          _output->off();
+        }
+        return;
+      }
+
+      // === 3. Едем ===
+      _wasStopped = false;
+      if (_on && (now - _stopStartTime > _offDelayMs)) {
+        _on = false;
+        _output->off();
+      }
+    }
+
+    bool isOn() const { return _on; }
+};
+
+// ============================================================================
+// Главный контроллер
 class MainController {
   private:
-    VoltageDropDetector _poleADetector;
-    VoltageDropDetector _poleBDetector;
     RCChannel _rcChannels[5];
     OutputController _outputs[5];
-    DualBlinker _blinkers;   // ЗАДАЧА В: единый контроллер обоих поворотников
-    ReverseLightController _reverseLight;   // ЗАДАЧА Б: контроллер огней ЗХ
-    StopLightController _stopLight;         // ЗАДАЧА А: контроллер стоп-сигналов
+    DualBlinker _blinkers;   // единый контроллер обоих поворотников
+    Tachometer _tacho;                    // тахометр
+    ReverseLightController _reverseLight;
+    StopLightController _stopLight;
     bool _tfFlag = false;
     bool _tlFlag = false;
     bool _trFlag = false;
     bool _tlrFlag = false;
     bool _prevChannelState[5] = {false, false, false, false, false};
-    unsigned long _lastLogTime = 0;   // ЗАДАЧА А: момент последнего вывода логов
+    unsigned long _lastLogTime = 0;   // момент последнего вывода логов
 
   public:
     MainController()
-      : _poleADetector(PIN_ANALOG_POLE_A, DIVIDER_RATIO, VREF,
-                       MIN_DROP_RATE, MIN_DROP_DURATION_MS,
-                       MAX_LOAD_TIME_MS, CUTOFF_VOLTAGE,
-                       CUTOFF_HOLD_MS, UPDATE_INTERVAL_MS),
-        _poleBDetector(PIN_ANALOG_POLE_B, DIVIDER_RATIO, VREF,
-                       MIN_DROP_RATE, MIN_DROP_DURATION_MS,
-                       MAX_LOAD_TIME_MS, CUTOFF_VOLTAGE,
-                       CUTOFF_HOLD_MS, UPDATE_INTERVAL_MS),
+      : _tacho(PIN_HALL_A, PIN_HALL_B),
         _rcChannels{
           RCChannel(PIN_RC_VT),
           RCChannel(PIN_RC_D0),
@@ -564,15 +414,12 @@ class MainController {
           OutputController(PIN_OUT_TR)       // 4 – ППП
         },
         _blinkers(&_outputs[3], &_outputs[4], BLINK1_ON_MS, BLINK1_OFF_MS),
-        _reverseLight(&_outputs[1], DIRECTION_THRESHOLD, LAMP_HOLD_MS, LAMP_HYSTERESIS_MS),
-        _stopLight(&_outputs[0], STOP_OFF_DELAY_MS, STOP_TIMEOUT_MS,
-                   STOP_SUBWINDOW_MS, STOP_FAST_THRESHOLD,
-                   STOP_SLOW_THRESHOLD, STOP_MOVE_THRESHOLD)
+        _reverseLight(&_outputs[1], &_tacho, REVERSE_HOLD_MS),
+        _stopLight(&_outputs[0], &_tacho, BRAKE_OFF_DELAY_MS, STOP_HOLD_MS)
     {}
 
     void begin() {
-      _poleADetector.begin();
-      _poleBDetector.begin();
+      _tacho.begin();
       for (uint8_t i = 0; i < 5; i++) {
         _rcChannels[i].begin();
         _outputs[i].begin();
@@ -585,59 +432,31 @@ class MainController {
     }
 
     void update() {
-      // Обновляем детекторы спада
-      _poleADetector.update();
-      _poleBDetector.update();
+            // Обновляем тахометр
+      _tacho.update();
 
-      // --- Управление стоп-фарами (ЗАДАЧА А: моментальное ON, 1 с задержка OFF) ---
-      // Логика вынесена в StopLightController. Работает по уровням vmax и rate,
-      // моментально включает при спаде и держит после остановки до 120 с.
-      _stopLight.update(_poleADetector.getLastVoltage(),
-                        _poleBDetector.getLastVoltage());
+      // Управление стоп-фарами (по тахометру)
+      _stopLight.update();
 
-      // === ЗАДАЧА А: подробное логирование детекторов ===
-      // Каждые LOG_INTERVAL_MS выводим реальные значения rate и пиков напряжения.
-      // Это позволит подобрать MIN_DROP_RATE осмысленно, а не наугад.
+      // Управление огнями заднего хода (по тахометру)
+      _reverseLight.update();
+
+      // Обновляем генератор мигания (один на оба поворотника)
+      _blinkers.update();
+
+      // === логирование тахометра (после всех update, показывает актуальное состояние) ===
       unsigned long nowForLog = millis();
       if (nowForLog - _lastLogTime >= LOG_INTERVAL_MS) {
         _lastLogTime = nowForLog;
-
-        Serial.print(F("A="));      Serial.print(_poleADetector.getLastVoltage(), 2);
-        Serial.print(F(" pk["));     Serial.print(_poleADetector.getPeakMin(), 2);
-        Serial.print('-');           Serial.print(_poleADetector.getPeakMax(), 2);
-        Serial.print(F("] rate="));  Serial.print(_poleADetector.getLastRate(), 2);
-        Serial.print(F(" drop="));   Serial.print(_poleADetector.getDropDuration());
-        Serial.print(F(" act="));    Serial.print(_poleADetector.isLoadActive() ? 1 : 0);
-
-        Serial.print(F(" || B="));   Serial.print(_poleBDetector.getLastVoltage(), 2);
-        Serial.print(F(" pk["));     Serial.print(_poleBDetector.getPeakMin(), 2);
-        Serial.print('-');           Serial.print(_poleBDetector.getPeakMax(), 2);
-        Serial.print(F("] rate="));  Serial.print(_poleBDetector.getLastRate(), 2);
-        Serial.print(F(" drop="));   Serial.print(_poleBDetector.getDropDuration());
-        Serial.print(F(" act="));    Serial.print(_poleBDetector.isLoadActive() ? 1 : 0);
-
-        Serial.print(F(" || SL sm=")); Serial.print(_stopLight.getLastSubMean(), 2);
-        Serial.print(F(" fr="));       Serial.print(_stopLight.getFastRate(), 2);
-        Serial.print(F(" sr="));       Serial.print(_stopLight.getSlowRate(), 2);
-        Serial.print(F(" mx="));       Serial.print(_stopLight.getBufMax(), 2);
-        Serial.print(F(" STOP="));     Serial.println(_stopLight.isOn() ? 1 : 0);
-
-        // Сбрасываем пики для следующего окна логирования
-        _poleADetector.resetPeaks();
-        _poleBDetector.resetPeaks();
+        Serial.print(F("DIR="));
+        Serial.print((int)_tacho.getDirection());  // (int) обязательно: int8_t иначе печатается как ASCII-символ
+        Serial.print(F(" BRK="));
+        Serial.print(_tacho.isBraking() ? 1 : 0);
+        Serial.print(F(" STOP="));
+        Serial.print(_stopLight.isOn() ? 1 : 0);
+        Serial.print(F(" REV="));
+        Serial.println(_reverseLight.isOn() ? 1 : 0);
       }
-
-      // --- Управление огнями заднего хода (по направлению вращения) ---
-      // ЗАДАЧА Б: вся логика вынесена в класс ReverseLightController.
-      // Он сам решает, когда зажигать и когда гасить огни, с учётом
-      // гистерезиса (защита от ШИМ) и 60-секундного удержания.
-      float voltageA = _poleADetector.getLastVoltage();
-      float voltageB = _poleBDetector.getLastVoltage();
-      float diff = voltageA - voltageB;
-      _reverseLight.update(diff);
-
-      // Обновляем генератор мигания (ЗАДАЧА В: один на оба поворотника)
-      _blinkers.update();
 
       // Чтение RC-каналов (при необходимости)
 
