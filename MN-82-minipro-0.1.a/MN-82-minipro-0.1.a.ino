@@ -5,12 +5,14 @@
 //  вторая нагрузка – по направлению вращения.
 // ============================================================
 
+#include "PowerManager.h"
+
 // ==================== НАСТРОЙКИ ====================
 // --- Пины ---
 const uint8_t PIN_ANALOG_POLE_A = A1;   // полюс A мотора
 const uint8_t PIN_ANALOG_POLE_B = A2;   // полюс B мотора
 
-const uint8_t PIN_RC_VT = 12;
+//const uint8_t PIN_RC_VT = 12;
 const uint8_t PIN_RC_D0 = 10;//8
 const uint8_t PIN_RC_D1 = 11;//9
 const uint8_t PIN_RC_D2 = 9;//11
@@ -21,6 +23,25 @@ const uint8_t PIN_OUT_AUX   = 5;    // задний Ход
 const uint8_t PIN_OUT_FL = 4;
 const uint8_t PIN_OUT_TL = 3;
 const uint8_t PIN_OUT_TR = 2;
+
+#define PIN_HOLD D13
+#define PIN_RC   D12
+#define PIN_HALL_1 A1
+#define PIN_HALL_2 A2
+
+// Конфигурация входов
+// 1. RC-модуль: активный HIGH, обычный INPUT
+// 2. Датчики Холла: активный LOW, INPUT_PULLUP (чтобы не висел в воздухе)
+const InputPin inputs[] = {
+  {PIN_RC,     HIGH, INPUT},
+  {PIN_HALL_1, LOW,  INPUT_PULLUP},
+  {PIN_HALL_2, LOW,  INPUT_PULLUP}
+};
+const uint8_t inputCount = sizeof(inputs) / sizeof(inputs[0]);
+
+// Настройки питания: удержание HIGH на D13, таймаут 5 минут (300000 мс)
+PowerManager power(PIN_HOLD, HIGH, inputs, inputCount, 300000);
+
 
 // --- Аналоговый делитель ---
 const float DIVIDER_RATIO = 0.3197;   // R2/(R1+R2)
@@ -716,9 +737,14 @@ MainController controller;
 
 // ==================== СТАНДАРТНЫЕ ФУНКЦИИ ====================
 void setup() {
+  // Инициализация менеджера питания должна быть ПЕРВОЙ
+  power.setShutdownCallback(onPowerOff);
+  power.begin();
   controller.begin();
 }
 
 void loop() {
+  // Опрос датчиков и таймера
+  power.update();
   controller.update();
 }
